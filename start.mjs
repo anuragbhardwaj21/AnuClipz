@@ -20,7 +20,14 @@ async function saveZip(url, file) {
   await new Promise((resolve, reject) => {
     get(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        saveZip(res.headers.location, file).then(resolve, reject)
+        res.resume()
+        const next = new URL(res.headers.location, url).href
+        saveZip(next, file).then(resolve, reject)
+        return
+      }
+      if (res.statusCode !== 200) {
+        res.resume()
+        reject(new Error(`Download failed (${res.statusCode}) for ${url}`))
         return
       }
       const out = createWriteStream(file)
