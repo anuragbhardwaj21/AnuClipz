@@ -22,7 +22,11 @@ type ReelFile = {
   quality: string
   start?: number
   path?: string
+  folder?: string
   meta_path?: string
+  thumb_path?: string
+  poster?: string
+  tags?: string
   instagram?: string
   youtube_title?: string
   youtube?: string
@@ -432,10 +436,14 @@ function LiveReel({ clip, image, video, index }: { clip: Clip; image: string; vi
 }
 
 function Phone({ image, hook, caption, video }: { image: string; hook: string; caption: string; video: string }) {
+  const preview = useRef<HTMLVideoElement>(null)
+  useEffect(() => {
+    preview.current?.pause()
+  }, [video])
   if (video) {
     return (
       <motion.div className="phone" initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ type: 'spring', bounce: 0.18, duration: 0.6 }}>
-        <video className="reel" src={video} controls playsInline autoPlay />
+        <video ref={preview} className="reel" src={video} controls playsInline preload="none" />
       </motion.div>
     )
   }
@@ -723,6 +731,9 @@ export function App() {
         })),
         film,
         export_dir: folder,
+        provider,
+        model,
+        api_key: apiKey.trim(),
       })
       await watch(id, (next) => {
         const ready = next.files?.length ? next.files : next.file ? [{ file: next.file, title: '', quality: next.quality || '' }] : []
@@ -930,8 +941,12 @@ export function App() {
                   </button>
                 </div>
                 <div className="copy-list">
-                  {openExport.path && <CopyCard kind="file" label="Saved file" text={openExport.path} />}
+                  {openExport.poster && <img className="poster" src={openExport.poster} alt="" />}
+                  {openExport.folder && <CopyCard kind="file" label="Folder" text={openExport.folder} />}
+                  {openExport.path && <CopyCard kind="file" label="Video" text={openExport.path} />}
+                  {openExport.thumb_path && <CopyCard kind="file" label="Thumbnail" text={openExport.thumb_path} />}
                   {openExport.meta_path && <CopyCard kind="file" label="Meta file" text={openExport.meta_path} />}
+                  {openExport.tags && <CopyCard kind="youtube" label="YouTube tags" text={maskText(openExport.tags)} />}
                   {openExport.instagram && <CopyCard kind="instagram" label="Instagram caption" text={maskText(openExport.instagram)} />}
                   {openExport.youtube_title && <CopyCard kind="youtube" label="YouTube title" text={maskText(openExport.youtube_title)} />}
                   {openExport.youtube && <CopyCard kind="youtube" label="YouTube description" text={maskText(openExport.youtube)} />}

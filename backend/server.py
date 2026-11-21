@@ -726,12 +726,70 @@ def clip_slug(title: str) -> str:
     return text[:48] or 'reel'
 
 
-def unique_stem(folder: Path, stem: str) -> str:
+def fit_tags(raw: str) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for piece in re.split(r'[,|\n]', str(raw or '')):
+        tag = re.sub(r'\s+', ' ', piece).strip().lstrip('#').strip()
+        tag = safe.censor(tag).replace('<', '').replace('>', '')
+        key = tag.lower()
+        if not tag or key in seen:
+            continue
+        trial = ','.join(parts + [tag])
+        if len(trial) > 500:
+            break
+        parts.append(tag)
+        seen.add(key)
+    return ','.join(parts)
+
+
+def fallback_pack(title: str, hook: str, film: str, duration: float) -> dict:
+    seeds = ['gta 6', 'gta vi', 'gta rp', 'gta funny moments', 'gta shorts', 'viral gta clip', hook, title, film]
+    return {'second': round(max(0.4, min(duration - 0.4, duration * 0.42)), 2), 'tags': fit_tags(','.join(seeds))}
+
+
+def pack_prompt(film: str, clips: list[dict]) -> str:
+    rows = []
+    for index, clip in enumerate(clips):
+        spoken = ' | '.join(str(line.get('text') or '') for line in (clip.get('lines') or [])[:14])[:420]
+        rows.append(f"{index}. title={clip.get('title')} | hook={clip.get('hook')} | why={str(clip.get('why') or '')[:180]} | spoken={spoken}")
+    return (
+        'You pack YouTube Shorts.\n'
+        'Return JSON only: {"packs":[{"index":0,"second":1.5,"tags":"tag one,tag two"}]}\n'
+        'second is the single craziest moment inside that clip, counted in seconds from the clip start. Stay inside the clip.\n'
+        'tags are the search phrases people type on YouTube for a clip like this. Biggest searches first. No hash sign. Separate tags with commas and no spaces. The tags string must be 500 characters or fewer, including commas.\n'
+        'If a word is sexual or a slur, write it already masked, like p*rn.\n'
+        f'Film: {film[:120]}\n' + '\n'.join(rows)
+    )
+
+
+def read_packs(provider: str, key: str, model: str, film: str, clips: list[dict], on_tokens) -> list[dict]:
+    raw = parse_json(ask(provider, key, model, pack_prompt(film, clips), on_tokens))
+    found = raw.get('packs') if isinstance(raw, dict) else None
+    return found if isinstance(found, list) else []
+
+
+def grab_thumb(src: Path, at: float, dest: Path):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(RENDER), '-y', '-hide_banner', '-loglevel', 'error',
+        '-ss', f'{max(0.0, at):.3f}', '-i', str(src), '-frames:v', '1',
+        '-vf', 'scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720',
+        str(dest),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0 or not dest.is_file():
+        raise RuntimeError(clean((proc.stderr or 'The thumbnail frame failed.')[-240:]))
+
+
+def unique_pack(folder: Path, stem: str) -> Path:
     candidate, number = stem, 2
-    while (folder / f'{candidate}.mp4').exists() or (folder / f'{candidate}-meta.txt').exists():
+    while (folder / candidate).exists():
         candidate = f'{stem}-{number}'
         number += 1
-    return candidate
+    dest = folder / candidate
+    dest.mkdir(parents=True)
+    return dest
 
 
 def prepare_folder(raw: str) -> Path:
@@ -794,6 +852,8 @@ def write_meta(path: Path, copy: dict, video: Path):
         f"YOUTUBE TITLE\n{copy['youtube_title']}\n\n"
         f"YOUTUBE DESCRIPTION\n{copy['youtube']}\n\n"
         f"TIKTOK\n{copy['tiktok']}\n\n"
+        f"YOUTUBE TAGS\n{copy.get('tags') or ''}\n\n"
+        f"THUMBNAIL\n{copy.get('thumbnail') or ''}\n\n"
         f"FILE\n{video}\n",
         encoding='utf-8',
     )
@@ -823,6 +883,9 @@ def run_cut(job_id: str, body: dict):
         from yt_dlp.utils import download_range_func
         folder = prepare_folder(str(body.get('export_dir') or ''))
         film = str(body.get('film') or '')
+        provider = str(body.get('provider') or '').strip().lower()
+        model = str(body.get('model') or '').strip()
+        key = str(body.get('api_key') or '').strip()
         files = []
         total = len(clips)
         part_dir = DATA / 'parts'
@@ -887,11 +950,41 @@ def run_cut(job_id: str, body: dict):
             update(job_id, progress=round(base + span * 0.75, 3), step=f'Rendering {index + 1} of {total}', detail=quality, quality=quality)
             out = DATA / 'reels' / f'{name}.mp4'
             quality = compose(src, pad, duration, hook, lines, out)
+            packs: list[dict] = []
+            if provider in ('google', 'openai') and model and len(key) >= 10:
+                update(job_id, progress=round(base + span * 0.86, 3), step=f'Packing {index + 1} of {total}', detail='The model is picking the craziest frame and the YouTube tags.')
+                try:
+                    def take_tokens(extra, job_id=job_id):
+                        current = snapshot(job_id).get('tokens') or blank_tokens()
+                        update(job_id, tokens={field: int(current.get(field) or 0) + int(extra.get(field) or 0) for field in ('prompt', 'output', 'thinking', 'total')})
+                    packs = read_packs(provider, key, model, film, [{
+                        'title': title, 'hook': hook, 'why': str(clip.get('why') or ''), 'lines': lines,
+                    }], take_tokens)
+                except Exception:
+                    packs = []
+            chosen = packs[0] if packs and isinstance(packs[0], dict) else {}
+            try:
+                second = float(chosen.get('second'))
+            except (TypeError, ValueError):
+                second = duration * 0.42
+            second = max(0.2, min(max(0.2, duration - 0.2), second))
+            tags = fit_tags(str(chosen.get('tags') or '')) or fallback_pack(title, hook, film, duration)['tags']
+            poster_name = f'{name}.png'
+            poster = DATA / 'reels' / poster_name
+            try:
+                grab_thumb(src, pad + second, poster)
+            except Exception:
+                poster = None
             copy = attract(title, hook, str(clip.get('why') or ''), film)
-            stem = unique_stem(folder, clip_slug(copy['title']))
-            dest = folder / f'{stem}.mp4'
-            meta = folder / f'{stem}-meta.txt'
+            copy['tags'] = tags
+            pack = unique_pack(folder, clip_slug(copy['title']))
+            dest = pack / 'video.mp4'
+            thumb = pack / 'thumbnail.png'
+            meta = pack / 'meta.txt'
             shutil.copy2(out, dest)
+            if poster and poster.is_file():
+                shutil.copy2(poster, thumb)
+                copy['thumbnail'] = str(thumb)
             write_meta(meta, copy, dest)
             files.append({
                 'file': f'/api/media/{name}.mp4',
@@ -899,7 +992,11 @@ def run_cut(job_id: str, body: dict):
                 'quality': quality,
                 'start': start,
                 'path': str(dest),
+                'folder': str(pack),
                 'meta_path': str(meta),
+                'thumb_path': str(thumb) if thumb.is_file() else '',
+                'poster': f'/api/poster/{poster_name}' if poster and poster.is_file() else '',
+                'tags': tags,
                 'instagram': copy['instagram'],
                 'youtube_title': copy['youtube_title'],
                 'youtube': copy['youtube'],
@@ -1029,6 +1126,16 @@ def thumb(name: str):
     if not path.is_file():
         fail('That frame is gone.', 404)
     return FileResponse(path, media_type='image/jpeg')
+
+
+@app.get('/api/poster/{name}')
+def poster(name: str):
+    if not re.fullmatch(r'[a-f0-9]{32}\.png', name):
+        fail('Not found.', 404)
+    path = DATA / 'reels' / name
+    if not path.is_file():
+        fail('That thumbnail is gone.', 404)
+    return FileResponse(path, media_type='image/png')
 
 
 @app.get('/api/media/{name}')
