@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type FormEvent, type PointerEvent, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import logo from '../gta6.png'
 
@@ -62,6 +62,26 @@ const NOTES: Record<string, string> = {
 const emptyTokens: Tokens = { prompt: 0, output: 0, thinking: 0, total: 0 }
 const RISK = /\b(?:pornographic|pornography|motherfucker|onlyfans|fucking|fucked|fucker|rapist|raping|nigga|nigger|faggot|porno|p0rn|pr0n|sexual|naked|nudity|nudes|boobs|titty|pussy|whore|retard|porn|sexy|nsfw|nude|boob|dick|cock|slut|rape|fuck|fag|sex|xxx)\b/gi
 
+function storedKey(name: string) {
+  return localStorage.getItem('clipper-key-' + name) || sessionStorage.getItem('clipper-key-' + name) || ''
+}
+
+function keyIsSaved(name: string, key: string) {
+  const trimmed = key.trim()
+  return trimmed.length >= 10 && localStorage.getItem('clipper-key-ok-' + name) === trimmed
+}
+
+function rememberKey(name: string, key: string, ok: boolean) {
+  const trimmed = key.trim()
+  sessionStorage.setItem('clipper-key-' + name, trimmed)
+  if (!ok) {
+    if (localStorage.getItem('clipper-key-ok-' + name) === trimmed) localStorage.removeItem('clipper-key-ok-' + name)
+    return
+  }
+  localStorage.setItem('clipper-key-' + name, trimmed)
+  localStorage.setItem('clipper-key-ok-' + name, trimmed)
+}
+
 function maskText(text: string) {
   return text.replace(RISK, (word) => (word.length < 2 ? '*' : word[0] + '*' + word.slice(2)))
 }
@@ -90,9 +110,12 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
   return data
 }
 
-function PlayerIcon({ name }: { name: 'play' | 'pause' | 'sound' | 'mute' | 'full' | 'exit' }) {
-  if (name === 'play') return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8 5.5v13l11-6.5L8 5.5Z" /></svg>
-  if (name === 'pause') return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 5h3.4v14H7V5Zm6.6 0H17v14h-3.4V5Z" /></svg>
+function PlayerIcon({ name }: { name: 'play' | 'pause' | 'sound' | 'mute' | 'full' | 'exit' | 'close' | 'copy' | 'check' }) {
+  if (name === 'play') return <svg className="play" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 5.8v12.4L18.2 12 9 5.8Z" /></svg>
+  if (name === 'pause') return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 5h3.2v14H7V5Zm6.8 0H17v14h-3.2V5Z" /></svg>
+  if (name === 'close') return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /></svg>
+  if (name === 'copy') return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8.5h9.5V18a1.5 1.5 0 0 1-1.5 1.5H8A1.5 1.5 0 0 1 6.5 18V10A1.5 1.5 0 0 1 8 8.5Z" fill="none" stroke="currentColor" strokeWidth="1.6" /><path d="M9.5 8.5V7A1.5 1.5 0 0 1 11 5.5h6A1.5 1.5 0 0 1 18.5 7v8a1.5 1.5 0 0 1-1.5 1.5h-1.5" fill="none" stroke="currentColor" strokeWidth="1.6" /></svg>
+  if (name === 'check') return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12.5 10 16.5 18 8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
   const d = name === 'sound'
     ? 'M4 10h3.2L12 6v12l-4.8-4H4v-4Zm9.2-1.6a4 4 0 0 1 0 7.2'
     : name === 'mute'
@@ -129,12 +152,14 @@ function ReelPlayer({ src }: { src: string }) {
   const video = useRef<HTMLVideoElement>(null)
   const stage = useRef<HTMLDivElement>(null)
   const hide = useRef(0)
+  const linger = useRef(0)
   const [playing, setPlaying] = useState(false)
   const [muted, setMuted] = useState(false)
   const [time, setTime] = useState(0)
   const [duration, setDuration] = useState(0)
   const [mark, setMark] = useState<'play' | 'pause' | null>(null)
   const [full, setFull] = useState(false)
+  const [hot, setHot] = useState(false)
 
   useEffect(() => {
     const node = video.current
@@ -146,6 +171,7 @@ function ReelPlayer({ src }: { src: string }) {
     return () => {
       node.removeEventListener('canplay', start)
       window.clearTimeout(hide.current)
+      window.clearTimeout(linger.current)
     }
   }, [src])
 
@@ -189,10 +215,22 @@ function ReelPlayer({ src }: { src: string }) {
     else void node.requestFullscreen()
   }
 
-  const shown = mark ?? (playing ? null : 'play')
+  function holdChrome(event: PointerEvent) {
+    if (event.pointerType === 'mouse') return
+    setHot(true)
+    window.clearTimeout(linger.current)
+    linger.current = window.setTimeout(() => setHot(false), 2400)
+  }
 
   return (
-    <div className="reel-stage" ref={stage} onClick={toggle}>
+    <div
+      className={hot ? 'reel-stage hot' : 'reel-stage'}
+      ref={stage}
+      onClick={toggle}
+      onPointerEnter={(event) => { if (event.pointerType === 'mouse') setHot(true) }}
+      onPointerLeave={(event) => { if (event.pointerType === 'mouse') setHot(false) }}
+      onPointerDown={holdChrome}
+    >
       <video
         ref={video}
         className="reel"
@@ -205,21 +243,26 @@ function ReelPlayer({ src }: { src: string }) {
         onPause={() => setPlaying(false)}
       />
       <AnimatePresence>
-        {shown && (
+        {mark && (
           <motion.span
-            key={shown}
+            key={mark}
             className="reel-mark"
-            initial={{ opacity: 0, scale: 0.72 }}
+            initial={{ opacity: 0, scale: 0.7 }}
             animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 1.12 }}
-            transition={{ duration: 0.22 }}
+            exit={{ opacity: 0, scale: 1.08 }}
+            transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
           >
-            <PlayerIcon name={shown} />
+            <PlayerIcon name={mark} />
           </motion.span>
         )}
       </AnimatePresence>
       <div className="reel-bar" onClick={(event) => event.stopPropagation()}>
-        <span className="reel-time">{clock(time)} / {clock(duration)}</span>
+        <div className="reel-meta">
+          <button type="button" aria-label={playing ? 'Pause' : 'Play'} onClick={toggle}>
+            <PlayerIcon name={playing ? 'pause' : 'play'} />
+          </button>
+          <span className="reel-time">{clock(time)} / {clock(duration)}</span>
+        </div>
         <div className="reel-actions">
           <button type="button" aria-label={muted ? 'Unmute' : 'Mute'} onClick={toggleMute}>
             <PlayerIcon name={muted ? 'mute' : 'sound'} />
@@ -233,14 +276,23 @@ function ReelPlayer({ src }: { src: string }) {
   )
 }
 
+function splitPath(text: string) {
+  const slash = Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'))
+  if (slash < 0) return { dir: '', name: text }
+  return { dir: text.slice(0, slash + 1), name: text.slice(slash + 1) }
+}
+
 function CopyCard({ kind, label, text }: { kind: string; label: string; text: string }) {
   const [copied, setCopied] = useState(false)
+  const file = kind === 'file' ? splitPath(text) : null
   return (
-    <article className="copy-card" data-kind={kind}>
+    <article className="panel copy-card" data-kind={kind}>
       <header>
-        <span>{label}</span>
+        <span className="label">{label}</span>
         <button
+          className="icon-btn"
           type="button"
+          aria-label={copied ? `${label} copied` : `Copy ${label}`}
           onClick={() => {
             void navigator.clipboard.writeText(text).then(() => {
               setCopied(true)
@@ -248,10 +300,14 @@ function CopyCard({ kind, label, text }: { kind: string; label: string; text: st
             })
           }}
         >
-          {copied ? 'Copied' : 'Copy'}
+          <PlayerIcon name={copied ? 'check' : 'copy'} />
         </button>
       </header>
-      <p>{text}</p>
+      {file ? (
+        <p className="path"><span>{file.dir}</span>{file.name}</p>
+      ) : (
+        <p>{text}</p>
+      )}
     </article>
   )
 }
@@ -435,6 +491,7 @@ function Work({ job }: { job: Job }) {
 export function App() {
   const [provider, setProvider] = useState('google')
   const [apiKey, setApiKey] = useState('')
+  const [keySaved, setKeySaved] = useState(false)
   const [models, setModels] = useState<Model[]>([])
   const [model, setModel] = useState('')
   const [count, setCount] = useState(4)
@@ -460,9 +517,10 @@ export function App() {
   useEffect(() => {
     const saved = sessionStorage.getItem('clipper-provider')
     const name = saved === 'openai' ? 'openai' : 'google'
-    const key = sessionStorage.getItem('clipper-key-' + name) || ''
+    const key = storedKey(name)
     setProvider(name)
     setApiKey(key)
+    setKeySaved(keyIsSaved(name, key))
     setNote(NOTES[name])
     if (key.trim().length >= 10) void loadModels(key, name)
     const savedFolder = sessionStorage.getItem('anuclipz-export-dir')
@@ -502,6 +560,7 @@ export function App() {
       setModel('')
       setModelNote('Paste the key. Models load on their own.')
       setModelWarn(false)
+      setKeySaved(false)
       return
     }
     setLoadingModels(true)
@@ -514,9 +573,13 @@ export function App() {
       const pick = data.models.some((item) => item.id === stored) ? stored! : data.recommended
       setModel(pick)
       sessionStorage.setItem('clipper-model-' + name, pick)
+      rememberKey(name, trimmed, true)
+      setKeySaved(true)
       setModelNote(`${data.models.length} models. The suggested one is the light model, so the call stays small.`)
     } catch (err) {
       setModels([])
+      rememberKey(name, trimmed, false)
+      setKeySaved(false)
       setModelNote(err instanceof Error ? err.message : 'Could not load models.')
       setModelWarn(true)
     } finally {
@@ -527,8 +590,9 @@ export function App() {
   function chooseProvider(name: string) {
     setProvider(name)
     sessionStorage.setItem('clipper-provider', name)
-    const key = sessionStorage.getItem('clipper-key-' + name) || ''
+    const key = storedKey(name)
     setApiKey(key)
+    setKeySaved(keyIsSaved(name, key))
     setNote(NOTES[name] || '')
     setModels([])
     setModel('')
@@ -540,6 +604,7 @@ export function App() {
     window.clearTimeout(keyWait.current)
     const trimmed = value.trim()
     sessionStorage.setItem('clipper-key-' + provider, trimmed)
+    setKeySaved(keyIsSaved(provider, trimmed))
     if (trimmed.length < 10) {
       setModels([])
       setModel('')
@@ -720,7 +785,14 @@ export function App() {
         </Field>
         <motion.div className="stack" variants={{ hidden: {}, show: { transition: { staggerChildren: 0.06 } } }}>
         <Field label="API key">
-          <input id="key" type="password" autoComplete="off" spellCheck={false} value={apiKey} placeholder="Paste the key" onChange={(event) => onKeyChange(event.target.value)} />
+          <div className="key-slot">
+            <input id="key" type="password" autoComplete="off" spellCheck={false} value={apiKey} placeholder="Paste the key" onChange={(event) => onKeyChange(event.target.value)} />
+            {keySaved && (
+              <span className="key-tick" role="img" aria-label="API key saved">
+                <PlayerIcon name="check" />
+              </span>
+            )}
+          </div>
           <p className="hint">{note}</p>
         </Field>
         <Field label="Model">
@@ -851,12 +923,11 @@ export function App() {
                 {openExport.file ? <ReelPlayer src={openExport.file} /> : <div className="sharp blank" />}
               </div>
               <div className="dialog-side">
-                <div className="moment-head">
-                  <div>
-                    <p className="eyebrow">Exported reel</p>
-                    <h2 id="export-title">{maskText(openExport.title || 'Reel')}</h2>
-                  </div>
-                  <button className="texty" type="button" onClick={() => setOpenExport(null)}>Close</button>
+                <div className="side-head">
+                  <h2 id="export-title">{maskText(openExport.title || 'Reel')}</h2>
+                  <button className="icon-btn" type="button" aria-label="Close" onClick={() => setOpenExport(null)}>
+                    <PlayerIcon name="close" />
+                  </button>
                 </div>
                 <div className="copy-list">
                   {openExport.path && <CopyCard kind="file" label="Saved file" text={openExport.path} />}

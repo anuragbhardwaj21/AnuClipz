@@ -221,6 +221,28 @@ input {
     font-size: 16px;
 }
 
+.key-slot { position: relative; }
+
+.key-slot input { padding-right: 48px; }
+
+.key-tick {
+    position: absolute;
+    top: 0;
+    right: 8px;
+    width: 36px;
+    height: 52px;
+    display: grid;
+    place-items: center;
+    color: #7dffa8;
+    pointer-events: none;
+}
+
+.key-tick svg {
+    display: block;
+    width: 18px;
+    height: 18px;
+}
+
 input::placeholder { color: #a08bb8; }
 
 input:focus, .menu-btn.open, .menu-btn:hover, .pick:hover {
@@ -576,11 +598,11 @@ h2 {
     display: grid;
     place-items: center;
     color: #fff;
-    background: rgba(8, 4, 14, 0.46);
+    background: rgba(8, 4, 14, 0.5);
     pointer-events: none;
 }
 
-.reel-mark svg { width: 32px; height: 32px; }
+.reel-mark svg { width: 30px; height: 30px; }
 
 .reel-bar {
     position: absolute;
@@ -592,9 +614,45 @@ h2 {
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 36px 12px 12px;
-    background: linear-gradient(transparent, rgba(0, 0, 0, 0.68));
+    padding: 36px 14px 14px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
+    opacity: 0;
+    transform: translateY(10px);
+    pointer-events: none;
+    transition: opacity 240ms ease, transform 240ms ease;
 }
+
+.reel-stage.hot .reel-bar,
+.reel-stage:focus-within .reel-bar {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+
+.reel-meta, .reel-actions { display: flex; align-items: center; gap: 8px; }
+
+.reel-meta button, .reel-actions button, .icon-btn {
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    display: grid;
+    place-items: center;
+    line-height: 0;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.42);
+}
+
+.reel-meta button:hover, .reel-actions button:hover, .icon-btn:hover { background: rgba(0, 0, 0, 0.62); }
+
+.reel-meta svg, .reel-actions svg, .icon-btn svg {
+    display: block;
+    width: 18px;
+    height: 18px;
+}
+
+.reel-meta svg.play, .reel-mark svg.play, .reel-actions svg.play { transform: translateX(1px); }
 
 .reel-time {
     color: #fff;
@@ -604,40 +662,41 @@ h2 {
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
 }
 
-.reel-actions { display: flex; gap: 8px; }
-
-.reel-actions button {
-    width: 40px;
-    height: 40px;
-    border: 0;
-    border-radius: 999px;
-    display: grid;
-    place-items: center;
-    color: #fff;
-    background: rgba(0, 0, 0, 0.38);
-}
-
-.reel-actions button:hover { background: rgba(0, 0, 0, 0.58); }
-
-.reel-actions svg { width: 20px; height: 20px; }
-
 .dialog-side {
     min-width: 0;
     height: 100%;
     overflow: hidden;
     display: flex;
     flex-direction: column;
-    gap: 16px;
-    padding: 28px 28px 24px;
+    gap: 20px;
+    padding: 28px 28px 20px;
+    background: #120818;
 }
 
-.dialog-side .moment-head { align-items: flex-start; margin: 0; }
+.side-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
 
 .dialog-side h2 {
-    margin-top: 4px;
-    font-size: clamp(26px, 2vw, 34px);
-    line-height: 1.15;
+    margin: 2px 0 0;
+    font-size: clamp(28px, 2.1vw, 36px);
+    line-height: 1.12;
+    letter-spacing: -0.02em;
 }
+
+.dialog-side .side-head .icon-btn {
+    flex: none;
+    margin-top: 2px;
+    color: #f4e9ff;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 186, 242, 0.34);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.dialog-side .side-head .icon-btn:hover { background: rgba(255, 77, 154, 0.16); }
 
 .copy-list {
     min-height: 0;
@@ -646,54 +705,46 @@ h2 {
     overscroll-behavior: contain;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 16px;
     padding-right: 4px;
 }
 
-.copy-card {
-    padding: 16px 18px 18px;
-    border-radius: 18px;
-    background: rgba(255, 255, 255, 0.045);
-    border: 1px solid rgba(255, 186, 242, 0.22);
-    border-top-width: 3px;
-    border-top-color: rgba(255, 255, 255, 0.28);
+.copy-card.panel {
+    padding: 20px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
 }
-
-.copy-card[data-kind="instagram"] { border-top-color: #ff4d9a; }
-.copy-card[data-kind="youtube"] { border-top-color: #ff8a3d; }
-.copy-card[data-kind="tiktok"] { border-top-color: #d946ef; }
 
 .copy-card header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    margin-bottom: 10px;
+    margin: 0 0 12px;
 }
 
-.copy-card header span {
-    color: #f0b7ff;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
+.copy-card header .label { margin: 0; }
+
+.copy-card .icon-btn {
+    width: 36px;
+    height: 36px;
+    color: #f6edff;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 186, 242, 0.34);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
-.copy-card header button {
-    min-height: 36px;
-    border: 1px solid rgba(255, 186, 242, 0.4);
-    border-radius: 999px;
-    padding: 6px 14px;
-    background: transparent;
-    color: #ffd0f2;
-    font-size: 13px;
-    font-weight: 600;
+.copy-card .icon-btn:hover {
+    background: rgba(255, 77, 154, 0.16);
+    border-color: rgba(255, 77, 154, 0.85);
 }
-
-.copy-card header button:hover { background: rgba(255, 77, 154, 0.16); }
 
 .copy-card p {
     margin: 0;
+    padding: 14px 16px;
+    border-radius: var(--radius);
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 186, 242, 0.34);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
     color: var(--text);
     font-size: 15px;
     line-height: 1.55;
@@ -701,11 +752,9 @@ h2 {
     word-break: break-word;
 }
 
-.copy-card[data-kind="file"] p {
-    font-size: 13px;
-    line-height: 1.45;
-    color: var(--soft);
-}
+.copy-card .path { font-size: 13px; line-height: 1.45; }
+
+.copy-card .path span { color: var(--soft); }
 
 .work {
     margin-top: var(--space-4);
@@ -965,5 +1014,5 @@ h2 {
 
 @media (prefers-reduced-motion: reduce) {
     .sheen, .orb { animation: none; }
-    .primary, .ghost, .pick, .menu-btn { transition: none; }
+    .primary, .ghost, .pick, .menu-btn, .reel-bar { transition: none; }
 }
