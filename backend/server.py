@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -25,8 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / 'data'
 TOOLS = ROOT / '.tools'
 FONTS = ROOT / 'fonts'
-RENDER = TOOLS / 'ffmpeg'
-PROBE = TOOLS / 'ffprobe'
+EXE = '.exe' if os.name == 'nt' else ''
+RENDER = TOOLS / f'ffmpeg{EXE}'
+PROBE = TOOLS / f'ffprobe{EXE}'
 HOT = {
     'no', 'never', 'wait', 'look', 'run', 'dead', 'kill', 'what', 'why', 'how', 'stop',
     'oh', 'wow', 'money', 'police', 'shot', 'missed', 'won', 'lost', 'crash', 'final',
@@ -140,8 +142,10 @@ def ydl_opts(**extra):
         'retries': 2,
         'noprogress': True,
     }
-    if os.path.isdir('/opt/homebrew/bin'):
+    if sys.platform == 'darwin' and os.path.isdir('/opt/homebrew/bin'):
         opts['ffmpeg_location'] = '/opt/homebrew/bin'
+    elif RENDER.is_file():
+        opts['ffmpeg_location'] = str(TOOLS)
     opts.update(extra)
     return opts
 
@@ -685,7 +689,7 @@ def has_audio(path: Path) -> bool:
 
 def compose(src: Path, pad: float, duration: float, hook: str, lines: list[dict], out: Path) -> str:
     if not RENDER.is_file():
-        raise RuntimeError('Caption burn needs .tools/ffmpeg. Run npm start once so Clipper can fetch it.')
+        raise RuntimeError('Caption burn needs the ffmpeg in .tools. Run npm start once so AnuClipz can fetch it.')
     out.parent.mkdir(parents=True, exist_ok=True)
     src_w, src_h = video_size(src)
     reel_w, reel_h, quality = reel_canvas(src_w, src_h)
@@ -918,18 +922,52 @@ def folder_default():
     return {'path': str(folder)}
 
 
-@app.post('/api/folder')
-def folder_pick():
-    try:
+def choose_directory() -> str:
+    if sys.platform == 'darwin':
         proc = subprocess.run(
             ['osascript', '-e', 'POSIX path of (choose folder with prompt "Save AnuClipz reels here")'],
             capture_output=True, text=True, timeout=180,
         )
+        return '' if proc.returncode != 0 else proc.stdout.strip()
+    if os.name == 'nt':
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$dialog.Description = 'Save AnuClipz reels here'; "
+            "$dialog.UseDescriptionForTitle = $true; "
+            "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }"
+        )
+        proc = subprocess.run(
+            ['powershell', '-NoProfile', '-STA', '-Command', script],
+            capture_output=True, text=True, timeout=180,
+        )
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        return '' if proc.returncode != 0 or not lines else lines[-1]
+    if shutil.which('zenity'):
+        proc = subprocess.run(
+            ['zenity', '--file-selection', '--directory', '--title=Save AnuClipz reels here'],
+            capture_output=True, text=True, timeout=180,
+        )
+        return '' if proc.returncode != 0 else proc.stdout.strip()
+    if shutil.which('kdialog'):
+        proc = subprocess.run(
+            ['kdialog', '--getexistingdirectory', str(Path.home()), '--title', 'Save AnuClipz reels here'],
+            capture_output=True, text=True, timeout=180,
+        )
+        return '' if proc.returncode != 0 else proc.stdout.strip()
+    raise RuntimeError('This system has no folder window. Install zenity, or type the folder another way.')
+
+
+@app.post('/api/folder')
+def folder_pick():
+    try:
+        chosen = choose_directory()
     except subprocess.TimeoutExpired:
         fail('The folder window timed out.')
-    if proc.returncode != 0:
-        return {'path': ''}
-    chosen = proc.stdout.strip()
+    except FileNotFoundError:
+        fail('The folder window could not open on this system.')
+    except RuntimeError as exc:
+        fail(str(exc))
     if not chosen:
         return {'path': ''}
     try:

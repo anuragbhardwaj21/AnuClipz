@@ -6,17 +6,25 @@ The reel is a tall frame: a title on top, the gameplay sharp in the middle, and 
 
 ## Run
 
-One command after a fresh clone. It installs the page, the Python tools, and, on an Apple silicon Mac, the caption ffmpeg, then opens the app.
+One command after a fresh clone, on Windows, macOS, or Linux. It installs the page, a Python environment, and the caption ffmpeg, then opens the app.
 
 ```bash
 git clone https://github.com/anuragbhardwaj21/AnuClipz.git && cd AnuClipz && npm start
+```
+
+On Windows PowerShell 5, use these three lines instead:
+
+```powershell
+git clone https://github.com/anuragbhardwaj21/AnuClipz.git
+cd AnuClipz
+npm start
 ```
 
 When the folder is already on the machine, run `npm start` inside it.
 
 Open http://127.0.0.1:5174
 
-The first run installs the page, a small Python environment, and, on an Apple silicon Mac, the caption ffmpeg.
+The machine needs Node.js and Python 3.10 or newer. The first run installs everything else.
 
 ## What spends tokens
 
