@@ -431,7 +431,6 @@ def take_clips(raw: dict, cands: list[dict], words: list[dict], count: int) -> l
         lines = caption_lines(words, cand['start'], cand['end']) or [{
             'start': 0, 'end': round(cand['end'] - cand['start'], 2), 'text': cand['text'][:120],
         }]
-        beeps = safe.beep_spans(words, cand['start'], cand['end']) or safe.spans_from_lines(lines)
         found.append({
             'start': cand['start'],
             'end': cand['end'],
@@ -442,7 +441,6 @@ def take_clips(raw: dict, cands: list[dict], words: list[dict], count: int) -> l
             'youtube': as_score(item.get('youtube')),
             'tiktok': as_score(item.get('tiktok')),
             'lines': [{**line, 'text': safe.censor(line['text'])} for line in lines],
-            'beeps': beeps,
         })
         if len(found) >= count:
             break
@@ -685,7 +683,7 @@ def has_audio(path: Path) -> bool:
     return bool(proc.stdout.strip())
 
 
-def compose(src: Path, pad: float, duration: float, hook: str, lines: list[dict], out: Path, beeps: list[dict] | None = None) -> str:
+def compose(src: Path, pad: float, duration: float, hook: str, lines: list[dict], out: Path) -> str:
     if not RENDER.is_file():
         raise RuntimeError('Caption burn needs .tools/ffmpeg. Run npm start once so Clipper can fetch it.')
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -706,16 +704,7 @@ def compose(src: Path, pad: float, duration: float, hook: str, lines: list[dict]
     )
     cmd = [str(RENDER), '-y', '-hide_banner', '-loglevel', 'error', '-i', str(src), '-filter_complex', graph, '-map', '[v]']
     if has_audio(src):
-        expr = safe.beep_enable(beeps or [])
-        graph += f';[0:a]atrim=start={start_at}:duration={length},asetpts=PTS-STARTPTS[speech]'
-        if expr:
-            graph += (
-                f";[speech]volume=0:enable='{expr}'[quiet];"
-                f"sine=frequency=1000:sample_rate=48000:duration={length},volume=0.22:enable='{expr}'[tone];"
-                f"[quiet][tone]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
-            )
-        else:
-            graph += ';[speech]anull[a]'
+        graph += f';[0:a]atrim=start={start_at}:duration={length},asetpts=PTS-STARTPTS[a]'
         cmd = [str(RENDER), '-y', '-hide_banner', '-loglevel', 'error', '-i', str(src), '-filter_complex', graph, '-map', '[v]', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
     cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '15', '-profile:v', 'high', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(out)]
     try:
@@ -842,8 +831,6 @@ def run_cut(job_id: str, body: dict):
             hook = str(clip.get('hook') or 'Watch this')[:80]
             title = str(clip.get('title') or hook)[:120]
             lines = [line for line in (clip.get('lines') or [])[:90] if isinstance(line, dict)]
-            sent = clip.get('beeps')
-            beeps = sent if isinstance(sent, list) and sent else safe.spans_from_lines(lines)
             hook = safe.censor(hook)
             title = safe.censor(title)
             lines = [{**line, 'text': safe.censor(str(line.get('text') or ''))} for line in lines]
@@ -895,7 +882,7 @@ def run_cut(job_id: str, body: dict):
             _, _, quality = reel_canvas(src_w, src_h)
             update(job_id, progress=round(base + span * 0.75, 3), step=f'Rendering {index + 1} of {total}', detail=quality, quality=quality)
             out = DATA / 'reels' / f'{name}.mp4'
-            quality = compose(src, pad, duration, hook, lines, out, beeps)
+            quality = compose(src, pad, duration, hook, lines, out)
             copy = attract(title, hook, str(clip.get('why') or ''), film)
             stem = unique_stem(folder, clip_slug(copy['title']))
             dest = folder / f'{stem}.mp4'

@@ -14,7 +14,6 @@ type Clip = {
   tiktok: number | null
   lines: Line[]
   thumb?: string
-  beeps?: { start: number; end: number }[]
 }
 type Tokens = { prompt: number; output: number; thinking: number; total: number }
 type ReelFile = {
@@ -656,7 +655,6 @@ export function App() {
           lines: clip.lines,
           title: clip.title,
           why: clip.why,
-          beeps: clip.beeps || [],
         })),
         film,
         export_dir: folder,

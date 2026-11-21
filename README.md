@@ -6,10 +6,13 @@ The reel is a tall frame: a title on top, the gameplay sharp in the middle, and 
 
 ## Run
 
+One command after a fresh clone. It installs the page, the Python tools, and, on an Apple silicon Mac, the caption ffmpeg, then opens the app.
+
 ```bash
-cd AnuClipz
-npm start
+git clone https://github.com/anuragbhardwaj21/AnuClipz.git && cd AnuClipz && npm start
 ```
+
+When the folder is already on the machine, run `npm start` inside it.
 
 Open http://127.0.0.1:5174
 

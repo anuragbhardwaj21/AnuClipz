@@ -1,8 +1,9 @@
 import { spawn, execSync } from 'node:child_process'
 import { existsSync, mkdirSync, createWriteStream } from 'node:fs'
 import { get } from 'node:https'
+import { fileURLToPath } from 'node:url'
 
-const root = new URL('.', import.meta.url).pathname
+const root = fileURLToPath(new URL('.', import.meta.url))
 process.chdir(root)
 
 function run(command) {
