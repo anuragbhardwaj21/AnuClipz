@@ -410,6 +410,12 @@ input:focus, .menu-btn.open {
     margin-bottom: var(--space-3);
 }
 
+.moment-head .film { margin-top: 6px; }
+
+.moments > .phone { margin: 0 auto var(--space-3); }
+
+.moments .preview-row { margin-top: var(--space-4); }
+
 h2 {
     font-family: Righteous, Poppins, sans-serif;
     font-size: 32px;
@@ -440,6 +446,71 @@ h2 {
     grid-template-columns: 1fr 1fr;
     gap: var(--space-2);
 }
+
+.moment {
+    display: grid;
+    grid-template-columns: minmax(148px, 200px) minmax(0, 1fr);
+    gap: 0;
+    align-items: stretch;
+    min-width: 0;
+    padding: 0;
+    overflow: hidden;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 186, 242, 0.34);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    cursor: pointer;
+    transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.moment:hover { border-color: rgba(255, 120, 190, 0.7); }
+
+.moment.on,
+.moment.on.focus {
+    border-width: 3px;
+    border-color: #ff4d9a;
+    box-shadow: none;
+}
+
+.moment.focus:not(.on) { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 0 0 3px rgba(255, 77, 154, 0.18); }
+
+.moment-reel {
+    min-width: 0;
+    display: flex;
+    align-self: stretch;
+}
+
+.moment-reel .phone {
+    width: 100%;
+    height: 100%;
+    min-height: 100%;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+.moment video { cursor: auto; }
+
+.moment .pick {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    gap: 12px;
+    height: 100%;
+    padding: 12px 14px 16px;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    border-radius: 0;
+}
+
+.moment .tick {
+    align-self: flex-end;
+    margin: 0;
+}
+
+.moment .pick.on,
+.moment .pick.focus { border-color: transparent; box-shadow: none; }
 
 .pick {
     width: 100%;
@@ -1015,6 +1086,7 @@ h2 {
 @media (max-width: 800px) {
     .app { padding: var(--space-3) var(--space-2) var(--space-5); }
     .moment-list, .tokens, .preview-row { grid-template-columns: 1fr; }
+    .moment { grid-template-columns: 120px minmax(0, 1fr); }
     header { align-items: flex-start; }
     h2 { font-size: 28px; }
     .mark { height: 56px; }
@@ -1023,5 +1095,5 @@ h2 {
 
 @media (prefers-reduced-motion: reduce) {
     .sheen, .orb { animation: none; }
-    .primary, .ghost, .pick, .menu-btn, .reel-bar { transition: none; }
+    .primary, .ghost, .pick, .moment, .menu-btn, .reel-bar { transition: none; }
 }

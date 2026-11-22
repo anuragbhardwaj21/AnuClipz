@@ -405,7 +405,7 @@ function Menu({ label, value, options, empty, onChange }: { label: string; value
   )
 }
 
-function LiveReel({ clip, image, video, index }: { clip: Clip; image: string; video: string; index: number }) {
+function LiveReel({ clip, image, video, index, bare = false }: { clip: Clip; image: string; video: string; index: number; bare?: boolean }) {
   const [line, setLine] = useState(-1)
   useEffect(() => {
     if (video || clip.lines.length === 0) return
@@ -422,6 +422,8 @@ function LiveReel({ clip, image, video, index }: { clip: Clip; image: string; vi
     return () => cancelAnimationFrame(frame)
   }, [clip, video])
   const caption = line >= 0 && clip.lines[line] ? clip.lines[line].text : ''
+  const phone = <Phone image={image} hook={maskText(clip.hook)} caption={maskText(caption)} video={video} />
+  if (bare) return <div className="moment-reel">{phone}</div>
   return (
     <motion.figure
       className="preview"
@@ -429,7 +431,7 @@ function LiveReel({ clip, image, video, index }: { clip: Clip; image: string; vi
       animate={{ opacity: 1, y: 0, scale: 1 }}
       transition={{ type: 'spring', bounce: 0.22, duration: 0.55, delay: index * 0.08 }}
     >
-      <Phone image={image} hook={maskText(clip.hook)} caption={maskText(caption)} video={video} />
+      {phone}
       <figcaption>{maskText(clip.title)}</figcaption>
     </motion.figure>
   )
@@ -835,7 +837,10 @@ export function App() {
         variants={{ hidden: {}, show: { transition: { delayChildren: 0.28, staggerChildren: 0.08 } } }}
       >
         <motion.div className="moment-head" variants={rise}>
-          <h2>Moments</h2>
+          <div>
+            <h2>Moments</h2>
+            {film && <p className="film">{film}</p>}
+          </div>
           {clips.length > 0 && (
             <button className="texty" type="button" onClick={() => setChosen(chosen.length === clips.length ? [] : clips.map((_, index) => index))}>
               {chosen.length === clips.length ? 'Clear' : 'Select all'}
@@ -843,34 +848,48 @@ export function App() {
           )}
         </motion.div>
         {clips.length === 0 && <motion.p className="empty" variants={rise}>Moments show up here after the model picks them. Each one says what the model found.</motion.p>}
+        {clips.length === 0 && (
+          <div className="preview-row" aria-hidden="true">
+            {Array.from({ length: count }, (_, index) => (
+              <figure className="preview" key={index}>
+                <Phone image="" hook="Title here" caption="Captions..." video="" />
+              </figure>
+            ))}
+          </div>
+        )}
         <motion.div className="moment-list" initial="hidden" animate="show" variants={{ hidden: {}, show: { transition: { staggerChildren: 0.07 } } }}>
           <AnimatePresence>
             {clips.map((item, index) => {
               const on = chosen.includes(index)
+              const video = videos.find((file) => file.start === item.start)?.file || videos.find((file) => file.title === item.title)?.file || ''
               return (
-                <motion.button
+                <motion.article
                   key={`${item.start}-${item.end}`}
-                  className={on ? (index === picked ? 'pick on focus' : 'pick on') : 'pick'}
-                  type="button"
-                  aria-pressed={on}
+                  className={on ? (index === picked ? 'moment on focus' : 'moment on') : 'moment'}
                   initial={{ opacity: 0, y: 20, scale: 0.96 }}
                   animate={{ opacity: 1, y: 0, scale: 1 }}
                   exit={{ opacity: 0, y: 10 }}
                   transition={{ type: 'spring', bounce: 0.28, duration: 0.55, delay: index * 0.07 }}
-                  whileTap={{ scale: 0.98 }}
-                  onClick={() => toggle(index)}
+                  onClick={(event) => {
+                    if ((event.target as HTMLElement).closest('video, button')) return
+                    toggle(index)
+                  }}
                 >
-                  <motion.span className="tick" aria-hidden="true" animate={{ scale: on ? 1 : 0.92 }} transition={{ type: 'spring', bounce: 0.3, duration: 0.35 }}>{on ? <Check /> : null}</motion.span>
-                  <div>
-                    <div className="title">{maskText(item.title)}</div>
-                    <div className="when">{clock(item.start)} – {clock(item.end)} · {maskText(item.hook)}</div>
-                    <p className="why">{maskText(item.why)}</p>
-                  </div>
-                </motion.button>
+                  <LiveReel bare clip={item} index={index} image={item.thumb || thumb} video={video} />
+                  <button className="pick" type="button" aria-pressed={on} onClick={() => toggle(index)}>
+                    <motion.span className="tick" aria-hidden="true" animate={{ scale: on ? 1 : 0.92 }} transition={{ type: 'spring', bounce: 0.3, duration: 0.35 }}>{on ? <Check /> : null}</motion.span>
+                    <div>
+                      <div className="title">{maskText(item.title)}</div>
+                      <div className="when">{clock(item.start)} – {clock(item.end)} · {maskText(item.hook)}</div>
+                      <p className="why">{maskText(item.why)}</p>
+                    </div>
+                  </button>
+                </motion.article>
               )
             })}
           </AnimatePresence>
         </motion.div>
+        {videos[0]?.quality && <p className="quality">{videos[0].quality}</p>}
         <motion.button className="where" type="button" variants={rise} onClick={() => void chooseFolder()} disabled={picking || busy}>
           <span className="label">Export location</span>
           <span className="path">{picking ? 'Choose a folder in the window that just opened.' : (folder || 'Downloads / AnuClipz')}</span>
@@ -880,25 +899,6 @@ export function App() {
         </motion.button>
       </motion.section>
       <AnimatePresence>{job && <Work key="work" job={job} />}</AnimatePresence>
-      <section className="stage panel" aria-label="Reel preview">
-        <div className="stage-head">
-          <h2>Previews</h2>
-          {film && <p className="film">{film}</p>}
-        </div>
-        {clips.length === 0 && <Phone image={thumb} hook="The plan breaks" caption="" video="" />}
-        <motion.div className="preview-row" initial="hidden" animate="show" variants={{ hidden: {}, show: { transition: { staggerChildren: 0.08 } } }}>
-          {clips.map((item, index) => (
-            <LiveReel
-              key={`${item.start}-${item.end}`}
-              clip={item}
-              index={index}
-              image={item.thumb || thumb}
-              video={videos.find((file) => file.start === item.start)?.file || videos.find((file) => file.title === item.title)?.file || ''}
-            />
-          ))}
-        </motion.div>
-        {videos[0]?.quality && <p className="quality">{videos[0].quality}</p>}
-      </section>
       <section className="exported panel" aria-label="Exported reels">
         <div className="stage-head">
           <h2>Exported</h2>
