@@ -1,6 +1,7 @@
 """Clipper engine. Local tools do the heavy work. The model only picks the cut."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -89,6 +90,82 @@ def pack_tokens(meta: dict | None) -> dict:
     thinking = int(meta.get('thoughtsTokenCount') or 0)
     total = int(meta.get('totalTokenCount') or meta.get('total_tokens') or (prompt + output + thinking))
     return {'prompt': prompt, 'output': output, 'thinking': thinking, 'total': total}
+
+
+SPEND = DATA / 'spend.json'
+
+
+def price_for(provider: str, model: str) -> tuple[float, float, str]:
+    name = (model or '').lower()
+    if provider == 'openai':
+        if 'mini' in name:
+            return 0.15, 0.60, 'GPT mini list price'
+        return 2.50, 10.0, 'larger GPT list price'
+    if '3.5' in name and 'lite' in name:
+        return 0.30, 2.50, 'Gemini 3.5 Flash-Lite list price'
+    if 'lite' in name:
+        return 0.10, 0.40, 'Gemini Flash-Lite list price'
+    if 'flash' in name:
+        return 0.30, 2.50, 'Gemini Flash list price'
+    return 1.25, 10.0, 'rough larger-model list price'
+
+
+def estimate_usd(provider: str, model: str, tokens: dict) -> tuple[float, str]:
+    incoming, outgoing, label = price_for(provider, model)
+    prompt = int(tokens.get('prompt') or 0)
+    output = int(tokens.get('output') or 0) + int(tokens.get('thinking') or 0)
+    usd = prompt / 1_000_000 * incoming + output / 1_000_000 * outgoing
+    return round(usd, 6), label
+
+
+def read_spend() -> dict:
+    if not SPEND.is_file():
+        return {'usd': 0, 'prompt': 0, 'output': 0, 'thinking': 0, 'runs': []}
+    try:
+        data = json.loads(SPEND.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return {'usd': 0, 'prompt': 0, 'output': 0, 'thinking': 0, 'runs': []}
+    return data if isinstance(data, dict) else {'usd': 0, 'prompt': 0, 'output': 0, 'thinking': 0, 'runs': []}
+
+
+def add_spend(provider: str, model: str, tokens: dict, note: str) -> dict:
+    usd, label = estimate_usd(provider, model, tokens)
+    if usd <= 0 and int(tokens.get('total') or 0) <= 0:
+        return read_spend()
+    DATA.mkdir(parents=True, exist_ok=True)
+    with LOCK:
+        current = read_spend()
+        runs = [item for item in (current.get('runs') or []) if isinstance(item, dict)]
+        runs.append({
+            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'provider': provider,
+            'model': model,
+            'prompt': int(tokens.get('prompt') or 0),
+            'output': int(tokens.get('output') or 0),
+            'thinking': int(tokens.get('thinking') or 0),
+            'usd': usd,
+            'rate': label,
+            'note': note,
+        })
+        payload = {
+            'usd': round(float(current.get('usd') or 0) + usd, 6),
+            'prompt': int(current.get('prompt') or 0) + int(tokens.get('prompt') or 0),
+            'output': int(current.get('output') or 0) + int(tokens.get('output') or 0),
+            'thinking': int(current.get('thinking') or 0) + int(tokens.get('thinking') or 0),
+            'rate': label,
+            'runs': runs[-200:],
+        }
+        SPEND.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+        return payload
+
+
+def charge(job_id: str, provider: str, model: str, tokens: dict, note: str):
+    payload = add_spend(provider, model, tokens, note)
+    current = snapshot(job_id).get('tokens') or blank_tokens()
+    merged = {name: int(current.get(name) or 0) + int(tokens.get(name) or 0) for name in ('prompt', 'output', 'thinking', 'total')}
+    usd, _label = estimate_usd(provider, model, tokens)
+    cost = round(float(snapshot(job_id).get('cost') or 0) + usd, 6)
+    update(job_id, tokens=merged, cost=cost, spend=float(payload.get('usd') or 0))
 
 
 def new_job() -> str:
@@ -246,6 +323,12 @@ def sentences(words: list[dict]) -> list[dict]:
                 'text': ' '.join(item['text'] for item in current),
             })
             current = []
+    if current:
+        groups.append({
+            'start': current[0]['start'],
+            'end': current[-1]['end'],
+            'text': ' '.join(item['text'] for item in current),
+        })
     return groups
 
 
@@ -393,6 +476,53 @@ def ask(provider: str, key: str, model: str, prompt: str, on_tokens) -> str:
         raise RuntimeError(message) from exc
 
 
+def ask_vision(provider: str, key: str, model: str, prompt: str, shots: list[tuple[int, bytes]], on_tokens) -> str:
+    if not shots:
+        return ask(provider, key, model, prompt, on_tokens)
+    if provider == 'google':
+        parts: list[dict] = [{'text': prompt}]
+        for number, raw in shots:
+            parts.append({'text': f'Picture for clip {number}.'})
+            parts.append({'inlineData': {'mimeType': 'image/jpeg', 'data': base64.b64encode(raw).decode()}})
+        data = post_json(
+            f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
+            {
+                'contents': [{'role': 'user', 'parts': parts}],
+                'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 1600},
+            },
+            {'x-goog-api-key': key},
+            timeout=180,
+        )
+        on_tokens(pack_tokens(data.get('usageMetadata')))
+        bits = ((data.get('candidates') or [{}])[0].get('content') or {}).get('parts') or []
+        text = '\n'.join(part.get('text') or '' for part in bits).strip()
+        if not text:
+            raise RuntimeError('The model returned no clip list.')
+        return text
+    content: list[dict] = [{'type': 'text', 'text': prompt}]
+    for number, raw in shots:
+        content.append({'type': 'text', 'text': f'Picture for clip {number}.'})
+        content.append({'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + base64.b64encode(raw).decode()}})
+    data = post_json(
+        'https://api.openai.com/v1/chat/completions',
+        {
+            'model': model,
+            'temperature': 0.2,
+            'max_tokens': 1600,
+            'response_format': {'type': 'json_object'},
+            'messages': [{'role': 'user', 'content': content}],
+        },
+        {'Authorization': f'Bearer {key}'},
+        timeout=180,
+    )
+    on_tokens(pack_tokens(data.get('usage')))
+    try:
+        return data['choices'][0]['message']['content']
+    except (KeyError, IndexError, TypeError) as exc:
+        message = (data.get('error') or {}).get('message') or 'ChatGPT returned nothing.'
+        raise RuntimeError(message) from exc
+
+
 def as_score(value) -> int | None:
     try:
         number = int(round(float(value)))
@@ -506,6 +636,144 @@ def moment_frames(info: dict, clips: list[dict]):
         sheet.unlink(missing_ok=True)
 
 
+def caption_rows(words: list[dict]) -> list[dict]:
+    rows = sentences(words)
+    for index, row in enumerate(rows):
+        row['id'] = index
+    return rows
+
+
+def row_chunks(rows: list[dict]) -> list[list[dict]]:
+    chunks, index, count = [], 0, len(rows)
+    while index < count and len(chunks) < 30:
+        start, chars, end = rows[index]['start'], 0, index
+        while end + 1 < count and rows[end + 1]['end'] - start <= 20 * 60 and chars < 12000:
+            end += 1
+            chars += len(rows[end]['text'])
+        chunks.append(rows[index:end + 1])
+        if end >= count - 1:
+            break
+        border = start + 17 * 60
+        nxt = index
+        while nxt + 1 <= end and rows[nxt + 1]['start'] < border:
+            nxt += 1
+        index = nxt + 1 if nxt >= index else end + 1
+    return chunks
+
+
+def fit_span(rows: list[dict], start_id: int, end_id: int):
+    by_id = {row['id']: pos for pos, row in enumerate(rows)}
+    if start_id not in by_id or end_id not in by_id:
+        return None
+    left, right = by_id[min(start_id, end_id)], by_id[max(start_id, end_id)]
+    while right > left and rows[right]['end'] - rows[left]['start'] > 42:
+        right -= 1
+    while right + 1 < len(rows) and rows[right]['end'] - rows[left]['start'] < 18 and rows[right + 1]['end'] - rows[left]['start'] <= 42:
+        right += 1
+    while left > 0 and rows[right]['end'] - rows[left]['start'] < 18 and rows[right]['end'] - rows[left - 1]['start'] <= 42:
+        left -= 1
+    start, end = float(rows[left]['start']), float(rows[right]['end'])
+    if end - start < 8 or end - start > 90:
+        return None
+    text = re.sub(r'\s+', ' ', ' '.join(row['text'] for row in rows[left:right + 1])).strip()
+    return round(start, 2), round(end, 2), text[:500]
+
+
+def pool_from_model(raw: dict, rows: list[dict]) -> list[dict]:
+    found = []
+    for item in raw.get('clips') or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            span = fit_span(rows, int(item.get('start_id')), int(item.get('end_id')))
+        except (TypeError, ValueError):
+            continue
+        if span is None:
+            continue
+        start, end, text = span
+        if any(overlaps({'start': start, 'end': end}, old) for old in found):
+            continue
+        hook = re.sub(r'\s+', ' ', str(item.get('hook') or '')).strip()
+        title = re.sub(r'\s+', ' ', str(item.get('title') or '')).strip()
+        why = re.sub(r'\s+', ' ', str(item.get('why') or '')).strip()
+        try:
+            heat = int(round(float(item.get('heat'))))
+        except (TypeError, ValueError):
+            heat = local_score(text)
+        found.append({
+            'start': start,
+            'end': end,
+            'text': text,
+            'hook': hook,
+            'title': title or hook,
+            'why': why,
+            'heat': max(0, min(99, heat)),
+            'score': local_score(text),
+        })
+    return found
+
+
+def discover_prompt(title: str, chunk: list[dict]) -> str:
+    lines = '\n'.join(f"{row['id']}|{row['start']:.0f}|{row['text'][:220]}" for row in chunk)
+    return (
+        'You hunt the crazy parts of one long video.\n'
+        'A crazy part makes a stranger stop scrolling: shock, a public fail, panic, an insult, or a payoff after a setup. Skip small talk.\n'
+        'Return JSON only: {"clips":[{"start_id":0,"end_id":0,"hook":"","title":"","why":"","heat":0}]}\n'
+        'Return at most 3 clips. Return none if this stretch is dull.\n'
+        'start_id and end_id are sentence ids from this list. The span should be 18 to 42 seconds and must stand alone.\n'
+        'hook is 3 to 6 words. title is one line a stranger would tap. why is what happens, then why it stops a scroll.\n'
+        'Write the hook, title, and why in English. The spoken lines below are already in English letters.\n'
+        'If a spoken word is sexual or a slur, write it masked, like p*rn.\n'
+        'heat is 0 to 99. Save 90 and above for a moment that is rare in the whole video.\n'
+        f'Video: {title[:120]}\n{lines}'
+    )
+
+
+def judge_prompt(title: str, cands: list[dict], count: int, pictured: list[int]) -> str:
+    rows = '\n'.join(
+        f"{n}. {cand['start']:.1f}-{cand['end']:.1f} | heat {cand.get('heat', 0)} | {cand.get('text', '')[:280]}"
+        for n, cand in enumerate(cands, 1)
+    )
+    pictures = ', '.join(str(n) for n in pictured) or 'none'
+    return (
+        'You are the last judge for short clips.\n'
+        'Return JSON only: {"clips":[{"start":0,"end":0,"hook":"","title":"","why":"","instagram":0,"youtube":0,"tiktok":0}]}\n'
+        f'Keep at most {count}. Keep fewer when the rest are weak. Copy start and end from the list. Do not invent a time.\n'
+        'Rank shock, whether the clip stands alone, and whether it has a setup and a payoff.\n'
+        f'Pictures are attached for clips {pictures}. A picture that is dull loses to a picture that is actually wild.\n'
+        'hook is 3 to 6 words, in English. If a word is sexual or a slur, write it masked, like p*rn.\n'
+        f'Video: {title[:120]}\n{rows}'
+    )
+
+
+def thumb_bytes(clip: dict) -> bytes | None:
+    match = re.fullmatch(r'/api/thumb/([a-f0-9]{32}\.jpg)', str(clip.get('thumb') or ''))
+    if not match:
+        return None
+    path = DATA / 'thumbs' / match.group(1)
+    if not path.is_file() or path.stat().st_size > 400_000:
+        return None
+    return path.read_bytes()
+
+
+def keep_best(cands: list[dict], limit: int) -> list[dict]:
+    ranked = sorted(cands, key=lambda item: (item.get('heat') or 0, item.get('score') or 0), reverse=True)
+    kept: list[dict] = []
+    for cand in ranked:
+        if any(overlaps(cand, old) for old in kept):
+            continue
+        kept.append(cand)
+        if len(kept) >= limit:
+            break
+    kept.sort(key=lambda item: item['start'])
+    return kept
+
+
+def save_board(folder: Path, payload: dict):
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / 'anuclipz-board.json').write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+
 def run_analyze(job_id: str, body: dict):
     key = str(body.get('api_key') or '').strip()
     provider = str(body.get('provider') or '').strip().lower()
@@ -532,38 +800,86 @@ def run_analyze(job_id: str, body: dict):
         words = captions.from_info(info) or []
         if len(words) < 20:
             raise RuntimeError('This video has no usable YouTube captions. Clipper reads the words first.')
-        limit = min(8, max(count + 2, 6))
-        cands = shortlist(words, limit)
-        if not cands:
-            raise RuntimeError('No spoken stretch was long enough to be a short.')
-        sent = sum(len(item['text'].split()) for item in cands)
-        update(
-            job_id, progress=0.52, step='Keeping the strong moments',
-            words_read=len(words), words_sent=sent,
-            detail=f'Local tools read {len(words)} words and kept {len(cands)} moments ({sent} words) for the model.',
-        )
-        count = min(count, len(cands))
+        rows = caption_rows(words)
         title = str(info.get('title') or 'Untitled')
-        prompt = prompt_for(title, cands, count)
+        chunks = row_chunks(rows)
+        update(
+            job_id, progress=0.4, step='Reading the story',
+            words_read=len(words), words_sent=sum(len(row['text'].split()) for row in rows),
+            detail=f'The model will read {len(rows)} sentences in {len(chunks)} sections, with the plot of what a crazy clip is.',
+        )
 
-        def on_tokens(tokens):
-            update(job_id, progress=0.78, step='The model is choosing the cuts', tokens=tokens, detail='Tokens are arriving from the model.')
+        def on_tokens(extra, note):
+            charge(job_id, provider, model, extra, note)
 
-        update(job_id, progress=0.64, step='Asking the model', detail=f'{model} is reading {sent} words from the short list. The rest of the video stays on this computer.')
-        text = ask(provider, key, model, prompt, on_tokens)
-        clips = take_clips(parse_json(text), cands, words, count)
+        pool: list[dict] = []
+        for index, chunk in enumerate(chunks):
+            update(job_id, progress=round(0.42 + (0.28 * (index + 1) / max(1, len(chunks))), 3), step='Reading the story', detail=f'Section {index + 1} of {len(chunks)}. The model can return nothing if this part is dull.')
+            try:
+                text = ask(provider, key, model, discover_prompt(title, chunk), lambda extra, note=f'section {index + 1}': on_tokens(extra, note))
+                pool.extend(pool_from_model(parse_json(text), rows))
+            except Exception:
+                continue
+        for cand in shortlist(words, max(count, 4)):
+            if any(overlaps(cand, old) for old in pool):
+                continue
+            pool.append({
+                'start': cand['start'],
+                'end': cand['end'],
+                'text': cand['text'],
+                'hook': '',
+                'title': '',
+                'why': 'Kept by the local word score in case the model skipped a loud moment.',
+                'heat': min(70, int(cand.get('score') or 0)),
+                'score': cand.get('score') or 0,
+            })
+        pool = keep_best(pool, max(count + 2, 6))
+        if not pool:
+            raise RuntimeError('No spoken stretch was strong enough to be a short.')
+        update(job_id, progress=0.74, step='Looking at the picture', detail='Frames are cut only for the finalists, not the whole video.')
+        moment_frames(info, pool)
+        shots = [(index, raw) for index, cand in enumerate(pool, 1) if (raw := thumb_bytes(cand))]
+        pictured = [number for number, _raw in shots]
+        update(job_id, progress=0.84, step='Judging the finalists', detail='One last call ranks shock, a setup, and a payoff. A dull picture can lose.')
+        try:
+            judged = ask_vision(
+                provider, key, model, judge_prompt(title, pool, count, pictured),
+                shots,
+                lambda extra: on_tokens(extra, 'final judge'),
+            )
+            clips = take_clips(parse_json(judged), pool, words, count)
+        except Exception:
+            clips = []
+        if not clips:
+            fallback = {'clips': [{
+                'start': cand['start'], 'end': cand['end'], 'hook': cand.get('hook') or '',
+                'title': cand.get('title') or '', 'why': cand.get('why') or '',
+            } for cand in pool]}
+            clips = take_clips(fallback, pool, words, count)
         if not clips:
             raise RuntimeError('The model did not pick usable times. Try again, or pick a lighter model.')
-        update(job_id, progress=0.9, step='Cutting a frame for each moment', detail='Each preview gets the picture from its own moment, not the cover.')
         moment_frames(info, clips)
         thumb = info.get('thumbnail') or ''
         if not isinstance(thumb, str) or not thumb.startswith('https://'):
             thumb = ''
+        card = source_card(info)
         tokens = snapshot(job_id).get('tokens') or blank_tokens()
+        cost = float(snapshot(job_id).get('cost') or 0)
+        try:
+            folder = prepare_folder(str(body.get('export_dir') or ''))
+            save_board(folder, {
+                'url': url,
+                'title': title[:180],
+                'thumbnail': thumb,
+                'clips': clips,
+                'source': card,
+            })
+        except Exception:
+            pass
         update(
             job_id, status='done', progress=1, step='Ready', title=title[:180], thumbnail=thumb,
-            clips=clips, error='',
-            detail=f'{len(clips)} moments ready. The model used {tokens.get("total", 0)} tokens.',
+            clips=clips, source=card, error='',
+            detail=f'{len(clips)} moments ready. This pass was about ${cost:.4f}. The running total stays on this computer.',
         )
     except HTTPException as exc:
         update(job_id, status='error', step='Stopped', error=str(exc.detail), detail=str(exc.detail))
@@ -733,38 +1049,104 @@ def fit_tags(raw: str) -> str:
         tag = re.sub(r'\s+', ' ', piece).strip().lstrip('#').strip()
         tag = safe.censor(tag).replace('<', '').replace('>', '')
         key = tag.lower()
-        if not tag or key in seen:
+        if len(tag) < 2 or key in seen:
             continue
         trial = ','.join(parts + [tag])
         if len(trial) > 500:
-            break
+            continue
         parts.append(tag)
         seen.add(key)
     return ','.join(parts)
 
 
-def fallback_pack(title: str, hook: str, film: str, duration: float) -> dict:
-    seeds = ['gta 6', 'gta vi', 'gta rp', 'gta funny moments', 'gta shorts', 'viral gta clip', hook, title, film]
-    return {'second': round(max(0.4, min(duration - 0.4, duration * 0.42)), 2), 'tags': fit_tags(','.join(seeds))}
+def fill_tags(primary: str, extras: list[str]) -> str:
+    tags = fit_tags(primary)
+    parts = [part for part in tags.split(',') if part]
+    seen = {part.lower() for part in parts}
+    for extra in extras:
+        tag = re.sub(r'\s+', ' ', str(extra or '')).strip().lstrip('#').strip()
+        tag = safe.censor(tag).replace('<', '').replace('>', '')
+        key = tag.lower()
+        if len(tag) < 2 or key in seen:
+            continue
+        trial = ','.join(parts + [tag])
+        if len(trial) > 500:
+            continue
+        parts.append(tag)
+        seen.add(key)
+        if len(','.join(parts)) >= 480:
+            break
+    return ','.join(parts)
 
 
-def pack_prompt(film: str, clips: list[dict]) -> str:
+def source_card(info: dict) -> dict:
+    raw_tags = info.get('tags') if isinstance(info.get('tags'), list) else []
+    description = re.sub(r'\s+', ' ', str(info.get('description') or '')).strip()
+    categories = info.get('categories') if isinstance(info.get('categories'), list) else []
+    return {
+        'title': safe.censor(str(info.get('title') or '')[:180]),
+        'channel': safe.censor(str(info.get('channel') or info.get('uploader') or '')[:80]),
+        'description': safe.censor(description[:800]),
+        'tags': [safe.censor(str(tag).strip()[:48]) for tag in raw_tags[:40] if str(tag).strip()],
+        'categories': [safe.censor(str(item)[:40]) for item in categories[:4] if str(item).strip()],
+    }
+
+
+def tag_extras(source: dict, title: str, hook: str) -> list[str]:
+    skip = {'this', 'that', 'with', 'from', 'have', 'your', 'just', 'what', 'when', 'where', 'here', 'there', 'they', 'them', 'then', 'than', 'into', 'about', 'some', 'long', 'right', 'now'}
+    texts = [title, hook, str(source.get('channel') or ''), str(source.get('title') or ''), str(source.get('description') or '')]
+    raw_tags = source.get('tags') if isinstance(source.get('tags'), list) else []
+    texts.extend(str(tag) for tag in raw_tags)
+    raw_categories = source.get('categories') if isinstance(source.get('categories'), list) else []
+    texts.extend(str(item) for item in raw_categories)
+    extras: list[str] = []
+    for text in texts:
+        words = [word for word in re.findall(r"[A-Za-z0-9']+", text) if len(word) > 2 and word.lower() not in skip]
+        if 2 <= len(text) <= 55:
+            extras.append(text)
+        for size in (3, 2):
+            for index in range(0, max(0, len(words) - size + 1)):
+                extras.append(' '.join(words[index:index + size]))
+        for word in words:
+            if len(word) >= 5:
+                extras.append(word)
+    channel = str(source.get('channel') or '').strip()
+    if channel:
+        extras.append(f'{channel} shorts')
+    extras.extend(['youtube shorts', 'funny moments', 'viral clip'])
+    return extras
+
+
+def fallback_pack(title: str, hook: str, film: str, duration: float, source: dict | None = None) -> dict:
+    seeds = [title, hook, film, 'funny moment', 'shorts', 'youtube shorts']
+    return {'second': round(max(0.4, min(duration - 0.4, duration * 0.42)), 2), 'tags': fill_tags(','.join(seeds), tag_extras(source or {}, title, hook))}
+
+
+def pack_prompt(film: str, clips: list[dict], source: dict) -> str:
     rows = []
     for index, clip in enumerate(clips):
         spoken = ' | '.join(str(line.get('text') or '') for line in (clip.get('lines') or [])[:14])[:420]
-        rows.append(f"{index}. title={clip.get('title')} | hook={clip.get('hook')} | why={str(clip.get('why') or '')[:180]} | spoken={spoken}")
+        rows.append(f"{index}. clip title={clip.get('title')} | hook={clip.get('hook')} | why={str(clip.get('why') or '')[:180]} | spoken={spoken}")
+    origin_tags = ', '.join(source.get('tags') or [])[:400]
     return (
-        'You pack YouTube Shorts.\n'
+        'You write the YouTube tag box for one Short.\n'
         'Return JSON only: {"packs":[{"index":0,"second":1.5,"tags":"tag one,tag two"}]}\n'
-        'second is the single craziest moment inside that clip, counted in seconds from the clip start. Stay inside the clip.\n'
-        'tags are the search phrases people type on YouTube for a clip like this. Biggest searches first. No hash sign. Separate tags with commas and no spaces. The tags string must be 500 characters or fewer, including commas.\n'
+        'second is the single craziest moment inside that clip, in seconds from the clip start. Stay inside the clip.\n'
+        'tags is one string of search phrases, biggest and most exact first. No hash sign. Separate tags with commas and no spaces after the commas.\n'
+        'The tags string must be at least 470 characters and at most 500, including the commas. Do not stop early.\n'
+        'Order: the exact phrase a stranger would type for this moment, close wordings of that phrase, common misspellings, the channel name, phrases from the source title, source tags that still match this clip, then broader searches for this kind of video.\n'
+        'Use the source title, description, channel, and existing tags below. Do not invent a celebrity or a topic that is not in this clip or this source video.\n'
         'If a word is sexual or a slur, write it already masked, like p*rn.\n'
-        f'Film: {film[:120]}\n' + '\n'.join(rows)
+        f"Channel: {source.get('channel') or 'unknown'}\n"
+        f"Source title: {source.get('title') or film[:160]}\n"
+        f"Source description: {source.get('description') or ''}\n"
+        f"Source tags: {origin_tags}\n"
+        + '\n'.join(rows)
     )
 
 
-def read_packs(provider: str, key: str, model: str, film: str, clips: list[dict], on_tokens) -> list[dict]:
-    raw = parse_json(ask(provider, key, model, pack_prompt(film, clips), on_tokens))
+def read_packs(provider: str, key: str, model: str, film: str, clips: list[dict], source: dict, on_tokens) -> list[dict]:
+    raw = parse_json(ask(provider, key, model, pack_prompt(film, clips, source), on_tokens))
     found = raw.get('packs') if isinstance(raw, dict) else None
     return found if isinstance(found, list) else []
 
@@ -886,6 +1268,14 @@ def run_cut(job_id: str, body: dict):
         provider = str(body.get('provider') or '').strip().lower()
         model = str(body.get('model') or '').strip()
         key = str(body.get('api_key') or '').strip()
+        source = body.get('source') if isinstance(body.get('source'), dict) else {}
+        if not str(source.get('channel') or source.get('description') or '').strip():
+            update(job_id, progress=0.04, step='Reading the source', detail='Title, description, channel, and the original tags.')
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
+                    source = source_card(ydl.extract_info(url, download=False))
+            except Exception:
+                source = source or {'title': film}
         files = []
         total = len(clips)
         part_dir = DATA / 'parts'
@@ -929,8 +1319,8 @@ def run_cut(job_id: str, body: dict):
 
             update(job_id, progress=round(base + 0.02, 3), step=f'Downloading {index + 1} of {total}', detail='Taking the highest picture YouTube has for this stretch.')
             with yt_dlp.YoutubeDL(ydl_opts(
-                format='bv*+ba/b',
-                format_sort=['res', 'br'],
+                format='bv*+ba[format_note*=original]/bv*+ba/b',
+                format_sort=['lang', 'res', 'br'],
                 merge_output_format='mp4',
                 outtmpl=str(part_dir / (name + '.%(ext)s')),
                 download_ranges=download_range_func(None, [(max(0.0, start - lead), end + 0.4)]),
@@ -955,11 +1345,10 @@ def run_cut(job_id: str, body: dict):
                 update(job_id, progress=round(base + span * 0.86, 3), step=f'Packing {index + 1} of {total}', detail='The model is picking the craziest frame and the YouTube tags.')
                 try:
                     def take_tokens(extra, job_id=job_id):
-                        current = snapshot(job_id).get('tokens') or blank_tokens()
-                        update(job_id, tokens={field: int(current.get(field) or 0) + int(extra.get(field) or 0) for field in ('prompt', 'output', 'thinking', 'total')})
+                        charge(job_id, provider, model, extra, 'tags and thumbnail')
                     packs = read_packs(provider, key, model, film, [{
                         'title': title, 'hook': hook, 'why': str(clip.get('why') or ''), 'lines': lines,
-                    }], take_tokens)
+                    }], source, take_tokens)
                 except Exception:
                     packs = []
             chosen = packs[0] if packs and isinstance(packs[0], dict) else {}
@@ -968,7 +1357,7 @@ def run_cut(job_id: str, body: dict):
             except (TypeError, ValueError):
                 second = duration * 0.42
             second = max(0.2, min(max(0.2, duration - 0.2), second))
-            tags = fit_tags(str(chosen.get('tags') or '')) or fallback_pack(title, hook, film, duration)['tags']
+            tags = fill_tags(str(chosen.get('tags') or ''), tag_extras(source, title, hook)) or fallback_pack(title, hook, film, duration, source)['tags']
             poster_name = f'{name}.png'
             poster = DATA / 'reels' / poster_name
             try:
@@ -1072,6 +1461,127 @@ def folder_pick():
     except Exception as exc:
         fail(clean(str(exc)) or 'That folder cannot be used.')
     return {'path': str(folder)}
+
+
+@app.get('/api/spend')
+def spend():
+    data = read_spend()
+    return {
+        'usd': float(data.get('usd') or 0),
+        'prompt': int(data.get('prompt') or 0),
+        'output': int(data.get('output') or 0),
+        'thinking': int(data.get('thinking') or 0),
+        'rate': str(data.get('rate') or 'Rough list price'),
+    }
+
+
+def parse_meta(text: str) -> dict:
+    matches = list(re.finditer(
+        r'^(TITLE|INSTAGRAM|YOUTUBE TITLE|YOUTUBE DESCRIPTION|TIKTOK|YOUTUBE TAGS|THUMBNAIL|FILE)\n',
+        text,
+        re.M,
+    ))
+    found = {}
+    for index, match in enumerate(matches):
+        stop = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        found[match.group(1)] = text[match.end():stop].strip()
+    return found
+
+
+def path_inside(folder: Path, path: Path) -> bool:
+    try:
+        path.resolve().relative_to(folder.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def saved_reel(folder: Path, name: str, video: Path, meta_path: Path, thumb: Path | None, kind: str) -> dict:
+    meta = parse_meta(meta_path.read_text(encoding='utf-8')) if meta_path.is_file() else {}
+    quoted_dir = urllib.parse.quote(str(folder))
+    quoted_name = urllib.parse.quote(name)
+    poster = ''
+    if thumb and thumb.is_file():
+        poster = f'/api/saved-file?dir={quoted_dir}&name={quoted_name}&kind=thumb'
+    return {
+        'file': f'/api/saved-file?dir={quoted_dir}&name={quoted_name}&kind={kind}',
+        'poster': poster,
+        'title': meta.get('TITLE') or name,
+        'path': str(video),
+        'folder': str(video.parent),
+        'meta_path': str(meta_path) if meta_path.is_file() else '',
+        'thumb_path': str(thumb) if thumb and thumb.is_file() else '',
+        'tags': meta.get('YOUTUBE TAGS') or '',
+        'instagram': meta.get('INSTAGRAM') or '',
+        'youtube_title': meta.get('YOUTUBE TITLE') or '',
+        'youtube': meta.get('YOUTUBE DESCRIPTION') or '',
+        'tiktok': meta.get('TIKTOK') or '',
+    }
+
+
+def saved_items(folder: Path) -> list[dict]:
+    items = []
+    if not folder.is_dir():
+        return items
+    packs = [path for path in folder.iterdir() if path.is_dir() and (path / 'video.mp4').is_file()]
+    packs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for child in packs:
+        thumb = child / 'thumbnail.png'
+        items.append(saved_reel(folder, child.name, child / 'video.mp4', child / 'meta.txt', thumb, 'video'))
+    loose = sorted((path for path in folder.glob('*.mp4') if path.is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
+    for video in loose:
+        items.append(saved_reel(folder, video.stem, video, folder / f'{video.stem}-meta.txt', None, 'loose'))
+    return items
+
+
+def read_board(folder: Path) -> dict | None:
+    path = folder / 'anuclipz-board.json'
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get('clips'), list):
+        return None
+    return {
+        'url': str(data.get('url') or ''),
+        'title': str(data.get('title') or ''),
+        'thumbnail': str(data.get('thumbnail') or ''),
+        'clips': data['clips'][:8],
+        'source': data.get('source') if isinstance(data.get('source'), dict) else {},
+    }
+
+
+@app.get('/api/saved')
+def saved(dir: str = ''):
+    try:
+        folder = prepare_folder(dir)
+    except Exception as exc:
+        fail(clean(str(exc)) or 'That folder cannot be used.')
+    return {'files': saved_items(folder), 'board': read_board(folder)}
+
+
+@app.get('/api/saved-file')
+def saved_file(dir: str, name: str, kind: str):
+    try:
+        folder = prepare_folder(dir)
+    except Exception as exc:
+        fail(clean(str(exc)) or 'That folder cannot be used.')
+    safe_name = Path(name).name
+    if not safe_name or safe_name != name or safe_name in {'.', '..'}:
+        fail('Not found.', 404)
+    if kind == 'loose':
+        path, media = folder / f'{safe_name}.mp4', 'video/mp4'
+    elif kind == 'video':
+        path, media = folder / safe_name / 'video.mp4', 'video/mp4'
+    elif kind == 'thumb':
+        path, media = folder / safe_name / 'thumbnail.png', 'image/png'
+    else:
+        fail('Not found.', 404)
+    if not path.is_file() or not path_inside(folder, path):
+        fail('Not found.', 404)
+    return FileResponse(path, media_type=media)
 
 
 @app.get('/api/health')

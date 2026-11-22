@@ -33,6 +33,7 @@ type ReelFile = {
   tiktok?: string
   thumb?: string
 }
+type Source = { title?: string; channel?: string; description?: string; tags?: string[]; categories?: string[] }
 type Job = {
   id: string
   status: 'running' | 'done' | 'error'
@@ -47,8 +48,11 @@ type Job = {
   file: string
   files: ReelFile[]
   quality: string
+  source?: Source
   words_read: number
   words_sent: number
+  cost?: number
+  spend?: number
 }
 type Model = { id: string; label: string }
 type Choice = { id: string; label: string }
@@ -64,6 +68,12 @@ const NOTES: Record<string, string> = {
 }
 
 const emptyTokens: Tokens = { prompt: 0, output: 0, thinking: 0, total: 0 }
+
+function money(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return '$0.00'
+  if (value < 0.01) return `$${value.toFixed(4)}`
+  return `$${value.toFixed(2)}`
+}
 const RISK = /\b(?:pornographic|pornography|motherfucker|onlyfans|fucking|fucked|fucker|rapist|raping|nigga|nigger|faggot|porno|p0rn|pr0n|sexual|naked|nudity|nudes|boobs|titty|pussy|whore|retard|porn|sexy|nsfw|nude|boob|dick|cock|slut|rape|fuck|fag|sex|xxx)\b/gi
 
 function storedKey(name: string) {
@@ -143,7 +153,7 @@ function ReelStill({ src }: { src: string }) {
       src={src}
       muted
       playsInline
-      preload="auto"
+      preload="metadata"
       onLoadedData={() => {
         const node = video.current
         if (node && node.currentTime < 0.05) node.currentTime = 0.4
@@ -152,7 +162,7 @@ function ReelStill({ src }: { src: string }) {
   )
 }
 
-function ReelPlayer({ src }: { src: string }) {
+function ReelPlayer({ src, poster = '' }: { src: string; poster?: string }) {
   const video = useRef<HTMLVideoElement>(null)
   const stage = useRef<HTMLDivElement>(null)
   const hide = useRef(0)
@@ -239,6 +249,7 @@ function ReelPlayer({ src }: { src: string }) {
         ref={video}
         className="reel"
         src={src}
+        poster={poster || undefined}
         playsInline
         preload="auto"
         onTimeUpdate={() => setTime(video.current?.currentTime || 0)}
@@ -493,6 +504,7 @@ function Work({ job }: { job: Job }) {
         <div><dt>Reply</dt><dd>{job.tokens?.output ?? 0}</dd></div>
         <div><dt>Thinking</dt><dd>{job.tokens?.thinking ?? 0}</dd></div>
         <div><dt>Total</dt><dd>{job.tokens?.total ?? 0}</dd></div>
+        <div><dt>About</dt><dd>{money(job.cost || 0)}</dd></div>
       </dl>
     </motion.section>
   )
@@ -514,6 +526,7 @@ export function App() {
   const [job, setJob] = useState<Job | null>(null)
   const [clips, setClips] = useState<Clip[]>([])
   const [film, setFilm] = useState('')
+  const [source, setSource] = useState<Source>({})
   const [thumb, setThumb] = useState('')
   const [picked, setPicked] = useState(0)
   const [chosen, setChosen] = useState<number[]>([])
@@ -523,6 +536,7 @@ export function App() {
   const [exported, setExported] = useState<ReelFile[]>([])
   const [openExport, setOpenExport] = useState<ReelFile | null>(null)
   const [busy, setBusy] = useState(false)
+  const [spend, setSpend] = useState(0)
 
   useEffect(() => {
     const saved = sessionStorage.getItem('clipper-provider')
@@ -547,13 +561,43 @@ export function App() {
     } catch {
       setExported([])
     }
+    void fetch('/api/spend').then(async (response) => {
+      const data = await response.json()
+      if (typeof data.usd === 'number') setSpend(data.usd)
+    }).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (!folder) return
+    let stop = false
+    void fetch('/api/saved?dir=' + encodeURIComponent(folder)).then(async (response) => {
+      if (!response.ok || stop) return
+      const data = await response.json()
+      if (stop) return
+      if (Array.isArray(data.files)) {
+        setExported(data.files)
+        sessionStorage.setItem('anuclipz-exported', JSON.stringify(data.files))
+      }
+      const board = data.board
+      if (board?.clips?.length) {
+        setClips(board.clips)
+        setChosen(board.clips.map((_: Clip, index: number) => index))
+        setFilm(board.title || '')
+        setThumb(board.thumbnail || '')
+        if (board.url) setUrl(board.url)
+        if (board.source) setSource(board.source)
+        setPicked(0)
+      }
+    }).catch(() => {})
+    return () => { stop = true }
+  }, [folder])
 
   async function watch(id: string, onDone: (next: Job) => void) {
     const timer = window.setInterval(async () => {
       const response = await fetch('/api/jobs/' + id)
       const next = await response.json() as Job
       setJob(next)
+      if (typeof next.spend === 'number') setSpend(next.spend)
       if (next.status !== 'running') {
         window.clearInterval(timer)
         setBusy(false)
@@ -647,6 +691,7 @@ export function App() {
     try {
       const { id } = await postJson<{ id: string }>('/api/jobs', {
         kind: 'analyze', url: url.trim(), provider, api_key: apiKey.trim(), model, count,
+        export_dir: folder,
       })
       await watch(id, (next) => {
         if (next.status === 'done') {
@@ -655,6 +700,7 @@ export function App() {
           setChosen(found.map((_, index) => index))
           setFilm(next.title || '')
           setThumb(next.thumbnail || '')
+          if (next.source) setSource(next.source)
           setPicked(0)
           setVideos([])
         }
@@ -732,6 +778,7 @@ export function App() {
           why: clip.why,
         })),
         film,
+        source,
         export_dir: folder,
         provider,
         model,
@@ -829,6 +876,7 @@ export function App() {
         <motion.button className="primary" type="submit" disabled={busy} variants={rise} whileHover={busy ? undefined : { y: -1 }} whileTap={{ scale: 0.985 }}>
           {busy ? 'Working' : 'Find the moments'}
         </motion.button>
+        <p className="hint">AI so far about {money(spend)}. A rough list price, saved on this computer.</p>
       </motion.form>
       <motion.section
         className="moments panel"
@@ -908,7 +956,7 @@ export function App() {
           {exported.map((item) => (
             <figure className="preview" key={item.path || item.file}>
               <div className="phone">
-                {item.file ? <ReelStill src={item.file} /> : <div className="sharp blank" />}
+                {item.poster ? <img className="reel" src={item.poster} alt="" /> : item.file ? <ReelStill src={item.file} /> : <div className="sharp blank" />}
                 <button className="phone-open" type="button" aria-label={`Open ${maskText(item.title || 'reel')}`} onClick={() => setOpenExport(item)} />
               </div>
               <figcaption>{maskText(item.title || 'Reel')}</figcaption>
@@ -931,7 +979,7 @@ export function App() {
               onClick={(event) => event.stopPropagation()}
             >
               <div className="dialog-reel">
-                {openExport.file ? <ReelPlayer src={openExport.file} /> : <div className="sharp blank" />}
+                {openExport.file ? <ReelPlayer src={openExport.file} poster={openExport.poster} /> : <div className="sharp blank" />}
               </div>
               <div className="dialog-side">
                 <div className="side-head">
