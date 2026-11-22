@@ -283,8 +283,6 @@ form, .stack {
     border: 2px solid #ffe14a;
     background: rgba(255, 225, 74, 0.18);
     cursor: grab;
-    min-width: 48px;
-    min-height: 36px;
 }
 
 .region.bottom {

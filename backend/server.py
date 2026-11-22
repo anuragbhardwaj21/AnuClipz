@@ -1144,7 +1144,7 @@ def region_frac(box) -> tuple[float, float, float, float]:
         x, y, w, h = float(box.get('x') or 0), float(box.get('y') or 0), float(box.get('w') or 1), float(box.get('h') or 0.5)
     except (TypeError, ValueError):
         x, y, w, h = 0, 0, 1, 0.5
-    w, h = min(1.0, max(0.12, w)), min(1.0, max(0.12, h))
+    w, h = min(1.0, max(0.04, w)), min(1.0, max(0.04, h))
     x, y = min(max(0.0, x), 1 - w), min(max(0.0, y), 1 - h)
     return x, y, w, h
 

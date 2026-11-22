@@ -140,10 +140,12 @@ function round4(value: number) {
   return Math.round(value * 10000) / 10000
 }
 
+const SPLIT_MIN_W = 0.045
+
 function lockSplit(box: Region): Region {
   const cx = box.x + box.w / 2
   const cy = box.y + box.h / 2
-  let height = clamp(box.h, 0.28, 1)
+  let height = clamp(box.h, SPLIT_MIN_W / SPLIT_RATIO, 1)
   let width = height * SPLIT_RATIO
   if (width > 1) {
     width = 1
@@ -157,16 +159,16 @@ function lockSplit(box: Region): Region {
 function resizeSplit(origin: Region, dx: number, dy: number): Region {
   const fromWidth = Math.abs(dx) >= Math.abs(dy)
   let width = fromWidth ? origin.w + dx : (origin.h + dy) * SPLIT_RATIO
-  const maxW = Math.max(0.12, 1 - origin.x)
-  const maxH = Math.max(0.12, 1 - origin.y)
+  const maxW = Math.max(SPLIT_MIN_W, 1 - origin.x)
+  const maxH = Math.max(SPLIT_MIN_W / SPLIT_RATIO, 1 - origin.y)
   const fitW = Math.min(maxW, maxH * SPLIT_RATIO)
-  width = clamp(width, Math.min(0.22, fitW), fitW)
+  width = clamp(width, Math.min(SPLIT_MIN_W, fitW), fitW)
   return { x: origin.x, y: origin.y, w: round4(width), h: round4(width / SPLIT_RATIO) }
 }
 
 function cropStyle(image: string, box: Region): CSSProperties {
-  const w = clamp(box.w, 0.12, 1)
-  const h = clamp(box.h, 0.12, 1)
+  const w = clamp(box.w, SPLIT_MIN_W, 1)
+  const h = clamp(box.h, SPLIT_MIN_W / SPLIT_RATIO, 1)
   const x = clamp(box.x, 0, 1 - w)
   const y = clamp(box.y, 0, 1 - h)
   const posX = w >= 0.999 ? '0%' : `${(x / (1 - w)) * 100}%`
