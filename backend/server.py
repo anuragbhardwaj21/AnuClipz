@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import select
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,7 +20,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 import captions
 import safe
@@ -232,7 +233,7 @@ def youtube_url(url: str) -> str:
     return url.split('&')[0]
 
 
-PREVIEW_LOCKS: dict[str, threading.Lock] = {}
+STREAMS: dict[str, dict] = {}
 RESOLVE = threading.Lock()
 
 
@@ -244,45 +245,129 @@ def watch_id(url: str) -> str:
     return urllib.parse.parse_qs(parsed.query).get('v', [''])[0]
 
 
-def preview_file(page: str, start: float, end: float) -> Path:
+def direct_url(raw: str) -> str:
+    parts = urllib.parse.urlsplit(raw)
+    query = [(key, value) for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True) if key.lower() != 'range']
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), ''))
+
+
+def ffmpeg_bin() -> str:
+    brew = Path('/opt/homebrew/bin/ffmpeg')
+    if sys.platform == 'darwin' and brew.is_file():
+        return str(brew)
+    local = TOOLS / 'ffmpeg'
+    return str(local) if local.is_file() else 'ffmpeg'
+
+
+def media_pair(page: str) -> dict:
     vid = watch_id(page)
     if not re.fullmatch(r'[\w-]{6,}', vid):
         raise RuntimeError('That link is not a video.')
-    if end <= start or end - start > 200:
-        raise RuntimeError('That part is not one scene.')
-    folder = SCRATCH / 'preview'
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f'{vid}-{int(start * 10)}-{int(end * 10)}.mp4'
-    key = path.name
+    now = time.time()
     with RESOLVE:
-        lock = PREVIEW_LOCKS.setdefault(key, threading.Lock())
-    with lock:
-        if path.is_file() and path.stat().st_size > 1000:
-            return path
-        import yt_dlp
-        from yt_dlp.utils import download_range_func
-        partial = path.with_suffix('.part.mp4')
-        partial.unlink(missing_ok=True)
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts(
-                format='bv*[height<=720][ext=mp4]+ba[format_note*=original]/bv*[height<=720]+ba/b',
-                format_sort=['lang', 'res', 'br'],
-                merge_output_format='mp4',
-                outtmpl=str(partial),
-                download_ranges=download_range_func(None, [(max(0.0, start), end + 0.2)]),
-                force_keyframes_at_cuts=True,
-            )) as ydl:
-                ydl.download([page])
-        except Exception:
-            partial.unlink(missing_ok=True)
-            raise
-        if not partial.is_file():
-            matches = sorted(folder.glob(path.stem + '.part.*'))
-            if not matches:
-                raise RuntimeError('That part did not download.')
-            partial = matches[0]
-        partial.replace(path)
-        return path
+        cached = STREAMS.get(vid)
+        if cached and cached['until'] > now:
+            return cached
+    import yt_dlp
+    with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
+        info = ydl.extract_info(page, download=False)
+    formats = info.get('formats') or []
+
+    def usable(fmt: dict) -> str:
+        raw = fmt.get('url')
+        return direct_url(str(raw)) if raw else ''
+
+    videos = []
+    for fmt in formats:
+        if fmt.get('vcodec') in (None, 'none') or fmt.get('acodec') not in (None, 'none'):
+            continue
+        height = int(fmt.get('height') or 0)
+        if not usable(fmt) or not 0 < height <= 720:
+            continue
+        videos.append(fmt)
+    videos.sort(key=lambda fmt: (1 if fmt.get('protocol') == 'https' else 0, int(fmt.get('height') or 0), float(fmt.get('tbr') or 0)))
+
+    def audio_rank(fmt: dict) -> tuple:
+        note = str(fmt.get('format_note') or '').lower()
+        if 'original' in note:
+            rank = 3
+        elif 'dub' in note:
+            rank = 0
+        else:
+            rank = 2
+        return (rank, float(fmt.get('abr') or 0))
+
+    audios = [fmt for fmt in formats if fmt.get('acodec') not in (None, 'none') and fmt.get('vcodec') in (None, 'none') and fmt.get('ext') in ('m4a', 'mp4') and usable(fmt)]
+    audios.sort(key=audio_rank)
+    if not videos or not audios:
+        raise RuntimeError('This video has no stream our player can open.')
+    headers = info.get('http_headers') or {}
+    item = {
+        'video': usable(videos[-1]),
+        'audio': usable(audios[-1]),
+        'agent': str(headers.get('User-Agent') or 'Mozilla/5.0'),
+        'duration': float(info.get('duration') or 0),
+        'until': time.time() + 30 * 60,
+    }
+    with RESOLVE:
+        STREAMS[vid] = item
+    return item
+
+
+def start_preview(page: str, start: float, end: float):
+    if end <= start:
+        raise RuntimeError('That part is not one scene.')
+    pair = media_pair(page)
+    length = min(float(SCENE_MAX), max(1.0, end - start))
+    begin = f'{max(0.0, start):.3f}'
+    span = f'{length:.3f}'
+    cmd = [
+        ffmpeg_bin(), '-hide_banner', '-loglevel', 'error', '-nostdin',
+        '-ss', begin, '-t', span, '-user_agent', pair['agent'], '-i', pair['video'],
+        '-ss', begin, '-t', span, '-user_agent', pair['agent'], '-i', pair['audio'],
+        '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'mp4', 'pipe:1',
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    ready, _, _ = select.select([proc.stdout], [], [], 20)
+    first = proc.stdout.read(64 * 1024) if ready and proc.stdout else b''
+    if not first:
+        proc.kill()
+        raise RuntimeError('That part could not be opened.')
+    return proc, first
+
+
+FRAME_LOCK = threading.Lock()
+
+
+def grab_frame(page: str, at: float | None) -> tuple[Path, float, float]:
+    pair = media_pair(page)
+    duration = float(pair.get('duration') or 0)
+    point = duration / 2 if at is None and duration > 1 else float(at or 0)
+    if duration > 1:
+        point = min(max(0.0, point), max(0.0, duration - 0.4))
+    else:
+        point = max(0.0, point)
+    second = int(round(point))
+    folder = SCRATCH / 'stills'
+    folder.mkdir(exist_ok=True)
+    path = folder / f'{watch_id(page)}-{second}.jpg'
+    if path.is_file() and path.stat().st_size > 800:
+        return path, float(second), duration
+    cmd = [
+        ffmpeg_bin(), '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+        '-ss', f'{point:.3f}', '-user_agent', pair['agent'], '-i', pair['video'],
+        '-frames:v', '1', '-q:v', '3', str(path),
+    ]
+    with FRAME_LOCK:
+        if path.is_file() and path.stat().st_size > 800:
+            return path, float(second), duration
+        proc = subprocess.run(cmd, capture_output=True, timeout=45)
+    if proc.returncode != 0 or not path.is_file() or path.stat().st_size < 800:
+        path.unlink(missing_ok=True)
+        raise RuntimeError('That frame could not be opened.')
+    return path, float(second), duration
 
 
 def ydl_opts(**extra):
@@ -767,7 +852,7 @@ def row_chunks(rows: list[dict]) -> list[list[dict]]:
 
 
 SCENE_MIN = 12
-SCENE_MAX = 180
+SCENE_MAX = 80
 
 
 def fit_span(rows: list[dict], start_id: int, end_id: int):
@@ -836,7 +921,7 @@ def discover_prompt(title: str, chunk: list[dict], query: str = '') -> str:
         'Return JSON only: {"clips":[{"start_id":0,"end_id":0,"hook":"","title":"","why":"","heat":0}]}\n'
         'Return every real moment in this stretch, at most 6. Return none if this stretch is dull.\n'
         'start_id is the sentence where the scene starts. end_id is the sentence after the payoff and the reaction. Do not start or end in the middle of a thought.\n'
-        'The span is 12 seconds to 3 minutes. A short punchline can be short. A chase keeps the setup and the ending.\n'
+        'The span is 12 to 80 seconds. Start where the scene starts and end when the payoff lands, on a sentence. Never go past 80 seconds.\n'
         + focus +
         'hook is 3 to 6 words. title is one line a stranger would tap. why is what happens, then why it stops a scroll.\n'
         'Write the hook, title, and why in English. The spoken lines below are already in English letters.\n'
@@ -1033,6 +1118,62 @@ def reel_canvas(src_w: int, src_h: int) -> tuple[int, int, str]:
     return reel_w, reel_h, note
 
 
+def type_places(layout: str, reel_w: int, reel_h: int, src_w: int, src_h: int) -> tuple[int, int, int, int]:
+    hook_size = max(48, round(reel_w * 0.128))
+    cap_size = max(36, round(reel_w * 0.077))
+    if layout == 'blur':
+        picture_top, picture_bottom = sharp_span(src_w, src_h, reel_w, reel_h)
+        gap = max(8, round(reel_h * 0.028))
+        hook_top = round(reel_h * 0.09)
+        room = picture_top - gap - hook_top
+        if room < hook_size:
+            hook_size = max(36, room)
+        lower = reel_h - (picture_bottom + gap) - round(reel_h * 0.05)
+        if lower < cap_size:
+            cap_size = max(28, lower)
+        return hook_top, hook_size, picture_bottom + gap, cap_size
+    hook_top = round(reel_h * 0.055)
+    cap_top = max(hook_top + hook_size, reel_h - cap_size - round(reel_h * 0.05))
+    return hook_top, hook_size, cap_top, cap_size
+
+
+def region_frac(box) -> tuple[float, float, float, float]:
+    if not isinstance(box, dict):
+        box = {}
+    try:
+        x, y, w, h = float(box.get('x') or 0), float(box.get('y') or 0), float(box.get('w') or 1), float(box.get('h') or 0.5)
+    except (TypeError, ValueError):
+        x, y, w, h = 0, 0, 1, 0.5
+    w, h = min(1.0, max(0.12, w)), min(1.0, max(0.12, h))
+    x, y = min(max(0.0, x), 1 - w), min(max(0.0, y), 1 - h)
+    return x, y, w, h
+
+
+def plate_graph(layout: str, reel_w: int, reel_h: int, start_at: str, length: str, splits: list) -> str:
+    head = f'[0:v]trim=start={start_at}:duration={length},setpts=PTS-STARTPTS'
+    if layout == 'full':
+        return head + f',scale={reel_w}:{reel_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={reel_w}:{reel_h}[base]'
+    if layout == 'split':
+        band = reel_h // 2
+        band -= band % 2
+        top = region_frac(splits[0] if splits else {'x': 0, 'y': 0, 'w': 1, 'h': 0.45})
+        bot = region_frac(splits[1] if len(splits) > 1 else {'x': 0, 'y': 0.55, 'w': 1, 'h': 0.45})
+        def crop(box):
+            x, y, w, h = box
+            return f'crop=iw*{w:.4f}:ih*{h:.4f}:iw*{x:.4f}:ih*{y:.4f},scale={reel_w}:{band}:force_original_aspect_ratio=increase:flags=lanczos,crop={reel_w}:{band}'
+        return (
+            head + ',split[sa][sb];'
+            f'[sa]{crop(top)}[top];[sb]{crop(bot)}[bot];'
+            f'[top][bot]vstack=inputs=2,scale={reel_w}:{reel_h}[base]'
+        )
+    return (
+        head + ',split[fg][bg];'
+        f'[bg]scale=1080:1920:force_original_aspect_ratio=increase:flags=bilinear,crop=1080:1920,boxblur=20:2,scale={reel_w}:{reel_h}:flags=bilinear[blur];'
+        f'[fg]scale={reel_w}:-2:flags=lanczos[sharp];'
+        '[blur][sharp]overlay=(W-w)/2:(H-h)/2:shortest=1[base]'
+    )
+
+
 def sharp_span(src_w: int, src_h: int, reel_w: int, reel_h: int) -> tuple[int, int]:
     if src_w < 2 or src_h < 2:
         src_w, src_h = 16, 9
@@ -1042,8 +1183,8 @@ def sharp_span(src_w: int, src_h: int, reel_w: int, reel_h: int) -> tuple[int, i
     return top, top + picture_h
 
 
-def write_ass(path: Path, hook: str, lines: list[dict], duration: float, reel_w: int, reel_h: int, src_w: int = 16, src_h: int = 9):
-    hook = ass_escape(hook).upper()[:80] or 'WATCH THIS'
+def write_ass(path: Path, hook: str, lines: list[dict], duration: float, reel_w: int, reel_h: int, src_w: int = 16, src_h: int = 9, layout: str = 'blur', show_hook: bool = True):
+    hook = ass_escape(hook).upper()[:80]
     rows = []
     for line in lines:
         text = ass_escape(str(line.get('text') or '')).upper()[:140]
@@ -1057,27 +1198,17 @@ def write_ass(path: Path, hook: str, lines: list[dict], duration: float, reel_w:
     rows.sort(key=lambda row: row[0])
     for row in rows:
         row[1] = min(duration, max(row[1], row[0] + 0.2))
-    hook_size = max(48, round(reel_w * 0.128))
-    cap_size = max(36, round(reel_w * 0.077))
+    side = round(reel_w * 0.06)
+    hook_top, hook_size, cap_y, cap_size = type_places(layout, reel_w, reel_h, src_w, src_h)
     hook_edge = max(2, round(reel_w * 0.0042))
     cap_edge = max(2, round(reel_w * 0.003))
-    side = round(reel_w * 0.06)
-    picture_top, picture_bottom = sharp_span(src_w, src_h, reel_w, reel_h)
-    gap = max(cap_edge * 2, round(reel_h * 0.028))
-    hook_top = round(reel_h * 0.09)
-    hook_room = picture_top - gap - hook_top
-    if hook_room < hook_size:
-        hook_size = max(36, hook_room)
-    lower_room = reel_h - (picture_bottom + gap) - round(reel_h * 0.05)
-    if lower_room < cap_size:
-        cap_size = max(28, lower_room)
     slide = max(6, round(reel_w * 8 / 380))
     center = reel_w // 2
-    hook_y = hook_top
-    cap_y = picture_bottom + gap
-    hook_tag = f'{{\\clip(0,0,{reel_w},{max(0, picture_top - gap)})\\fad(250,0)\\move({center},{hook_y + slide},{center},{hook_y},0,250)}}'
-    cap_tag = f'{{\\clip(0,{picture_bottom},{reel_w},{reel_h})\\fad(250,180)\\move({center},{cap_y + slide},{center},{cap_y},0,180)}}'
-    events = [f'Dialogue: 0,{ass_time(0)},{ass_time(duration)},Hook,,0,0,0,,{hook_tag}{hook}']
+    events = []
+    if show_hook and hook:
+        hook_tag = f'{{\\fad(250,0)\\move({center},{hook_top + slide},{center},{hook_top},0,250)}}'
+        events.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration)},Hook,,0,0,0,,{hook_tag}{hook}')
+    cap_tag = f'{{\\fad(250,180)\\move({center},{cap_y + slide},{center},{cap_y},0,180)}}'
     events += [f'Dialogue: 0,{ass_time(a)},{ass_time(b)},Cap,,0,0,0,,{cap_tag}{text}' for a, b, text in rows]
     path.write_text('\n'.join([
         '[Script Info]', 'ScriptType: v4.00+', f'PlayResX: {reel_w}', f'PlayResY: {reel_h}', 'WrapStyle: 0', 'ScaledBorderAndShadow: yes', '',
@@ -1113,7 +1244,7 @@ def page_text(text: str) -> str:
             .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;'))
 
 
-def draw_type(folder: Path, hook: str, lines: list[dict], duration: float, reel_w: int, reel_h: int, src_w: int, src_h: int) -> Path | None:
+def draw_type(folder: Path, hook: str, lines: list[dict], duration: float, reel_w: int, reel_h: int, src_w: int, src_h: int, layout: str = 'blur', show_hook: bool = True) -> Path | None:
     if not (FONTS / 'Anton-Regular.ttf').is_file() or not shutil.which('npx'):
         return None
     folder.mkdir(parents=True, exist_ok=True)
@@ -1121,16 +1252,7 @@ def draw_type(folder: Path, hook: str, lines: list[dict], duration: float, reel_
         src = FONTS / font
         if src.is_file():
             shutil.copy2(src, folder / font)
-    hook_size = max(48, round(reel_w * 0.128))
-    cap_size = max(36, round(reel_w * 0.077))
-    picture_top, picture_bottom = sharp_span(src_w, src_h, reel_w, reel_h)
-    gap = max(8, round(reel_h * 0.028))
-    hook_top = round(reel_h * 0.09)
-    if picture_top - gap - hook_top < hook_size:
-        hook_size = max(36, picture_top - gap - hook_top)
-    if reel_h - (picture_bottom + gap) - round(reel_h * 0.05) < cap_size:
-        cap_size = max(28, reel_h - (picture_bottom + gap) - round(reel_h * 0.05))
-    cap_top = picture_bottom + gap
+    hook_top, hook_size, cap_top, cap_size = type_places(layout, reel_w, reel_h, src_w, src_h)
     groups = []
     for line in lines:
         text = re.sub(r'\s+', ' ', str(line.get('text') or '')).strip()
@@ -1144,13 +1266,17 @@ def draw_type(folder: Path, hook: str, lines: list[dict], duration: float, reel_
     groups.sort()
     for index, group in enumerate(groups[:-1]):
         groups[index] = (group[0], min(group[1], max(group[0] + 0.16, groups[index + 1][0] - 0.04)), group[2])
-    blocks = [
-        f'<h1 class="clip hook" data-start="0" data-duration="{duration:.3f}" data-track-index="0">{page_text(hook.upper()[:80] or "WATCH THIS")}</h1>'
-    ]
+    blocks = []
+    if show_hook and hook.strip():
+        blocks.append(
+            f'<h1 class="clip hook" data-start="0" data-duration="{duration:.3f}" data-track-index="0">{page_text(hook.upper()[:80])}</h1>'
+        )
     for start, end, text in groups:
         blocks.append(
             f'<p class="clip cap" data-start="{start:.3f}" data-duration="{max(0.16, end - start):.3f}" data-track-index="1">{page_text(text.upper()[:140])}</p>'
         )
+    if not blocks:
+        return None
     html = f'''<!doctype html>
 <html lang="en">
 <head>
@@ -1184,7 +1310,7 @@ html, body, #root {{ margin: 0; width: {reel_w}px; height: {reel_h}px; overflow:
     return out
 
 
-def compose(src: Path, pad: float, duration: float, hook: str, lines: list[dict], out: Path, overlay: Path | None = None) -> str:
+def compose(src: Path, pad: float, duration: float, hook: str, lines: list[dict], out: Path, overlay: Path | None = None, layout: str = 'blur', splits: list | None = None, show_hook: bool = True) -> str:
     if not RENDER.is_file():
         raise RuntimeError('Caption burn needs the ffmpeg in .tools. Run npm start once so AnuClipz can fetch it.')
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1194,20 +1320,18 @@ def compose(src: Path, pad: float, duration: float, hook: str, lines: list[dict]
     ass = out.with_suffix('.ass')
     start_at = f'{max(0.0, pad):.3f}'
     length = f'{max(0.3, duration):.3f}'
-    plate = (
-        f'[0:v]trim=start={start_at}:duration={length},setpts=PTS-STARTPTS,split[fg][bg];'
-        f'[bg]scale=1080:1920:force_original_aspect_ratio=increase:flags=bilinear,crop=1080:1920,boxblur=20:2,scale={reel_w}:{reel_h}:flags=bilinear[blur];'
-        f'[fg]scale={reel_w}:-2:flags=lanczos[sharp];'
-        '[blur][sharp]overlay=(W-w)/2:(H-h)/2:shortest=1[base]'
-    )
+    plate = plate_graph(layout, reel_w, reel_h, start_at, length, splits or [])
     if use_type:
         graph = plate + ';[base][1:v]overlay=0:0:eof_action=pass:format=auto[v]'
         inputs = ['-i', str(src), '-c:v', 'libvpx-vp9', '-i', str(overlay)]
-    else:
-        write_ass(ass, safe.censor(hook), [{**line, 'text': safe.censor(str(line.get('text') or ''))} for line in lines], duration, reel_w, reel_h, src_w, src_h)
+    elif (show_hook and hook.strip()) or lines:
+        write_ass(ass, safe.censor(hook), [{**line, 'text': safe.censor(str(line.get('text') or ''))} for line in lines], duration, reel_w, reel_h, src_w, src_h, layout, show_hook)
         ass_arg = str(ass).replace('\\', '\\\\').replace(':', '\\:')
         fonts_arg = str(FONTS).replace('\\', '\\\\').replace(':', '\\:')
         graph = plate + f';[base]ass={ass_arg}:fontsdir={fonts_arg}[v]'
+        inputs = ['-i', str(src)]
+    else:
+        graph = plate.replace('[base]', '[v]')
         inputs = ['-i', str(src)]
     cmd = [str(RENDER), '-y', '-hide_banner', '-loglevel', 'error', *inputs, '-filter_complex', graph, '-map', '[v]']
     if has_audio(src):
@@ -1217,7 +1341,7 @@ def compose(src: Path, pad: float, duration: float, hook: str, lines: list[dict]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
         if use_type and (proc.returncode != 0 or not out.is_file()):
-            return compose(src, pad, duration, hook, lines, out, None)
+            return compose(src, pad, duration, hook, lines, out, None, layout, splits, show_hook)
     finally:
         ass.unlink(missing_ok=True)
     if proc.returncode != 0 or not out.is_file():
@@ -1480,6 +1604,10 @@ def run_cut(job_id: str, body: dict):
         model = str(body.get('model') or '').strip()
         key = str(body.get('api_key') or '').strip()
         source = body.get('source') if isinstance(body.get('source'), dict) else {}
+        layout = str(body.get('layout') or 'blur')
+        if layout not in ('blur', 'full', 'split'):
+            layout = 'blur'
+        splits = body.get('splits') if isinstance(body.get('splits'), list) else []
         if not str(source.get('channel') or source.get('description') or '').strip():
             update(job_id, progress=0.04, step='Reading the source', detail='Title, description, channel, and the original tags.')
             try:
@@ -1493,7 +1621,7 @@ def run_cut(job_id: str, body: dict):
             start, end = float(clip.get('start')), float(clip.get('end'))
             duration = end - start
             if duration < SCENE_MIN or duration > SCENE_MAX:
-                raise RuntimeError('That clip is not one scene.')
+                raise RuntimeError('Keep each scene between 12 and 80 seconds.')
             hook = str(clip.get('hook') or 'Watch this')[:80]
             title = str(clip.get('title') or hook)[:120]
             lines = [line for line in (clip.get('lines') or [])[:90] if isinstance(line, dict)]
@@ -1501,7 +1629,9 @@ def run_cut(job_id: str, body: dict):
             title = safe.censor(title)
             lines = [{**line, 'text': safe.censor(str(line.get('text') or ''))} for line in lines]
             show_captions = clip.get('captions') is not False
+            show_title = clip.get('show_title') is not False
             burned = lines if show_captions else []
+            burn_hook = hook if show_title else ''
             lead = 2.0 if start >= 2 else max(0.0, start)
             scratch = Path(tempfile.mkdtemp(prefix='anuclipz-part-'))
             scratches.append(scratch)
@@ -1552,12 +1682,12 @@ def run_cut(job_id: str, body: dict):
             update(job_id, progress=round(base + span * 0.72, 3), step=f'Drawing the type {index + 1} of {total}', detail='HyperFrames is setting the hook and the captions.' if show_captions else 'HyperFrames is setting the hook. Captions stay off for this one.')
             overlay = None
             try:
-                overlay = draw_type(scratch / 'frames', hook, burned, duration, reel_w, reel_h, src_w, src_h)
+                overlay = draw_type(scratch / 'frames', burn_hook, burned, duration, reel_w, reel_h, src_w, src_h, layout, show_title)
             except (OSError, subprocess.TimeoutExpired):
                 overlay = None
             update(job_id, progress=round(base + span * 0.8, 3), step=f'Rendering {index + 1} of {total}', detail=quality, quality=quality)
             out = scratch / 'reel.mp4'
-            quality = compose(src, pad, duration, hook, burned, out, overlay)
+            quality = compose(src, pad, duration, burn_hook, burned, out, overlay, layout, splits, show_title)
             packs: list[dict] = []
             if provider in ('google', 'openai') and model and len(key) >= 10:
                 update(job_id, progress=round(base + span * 0.9, 3), step=f'Packing {index + 1} of {total}', detail='The model is writing the title, the description, and the tags.')
@@ -1792,11 +1922,40 @@ def saved_file(dir: str, name: str, kind: str):
 def preview(url: str, start: float, end: float):
     page = youtube_url(url)
     try:
-        path = preview_file(page, start, end)
+        proc, first = start_preview(page, start, end)
     except Exception as exc:
         message = re.sub(r'https?://\S+', '', clean(str(exc))).strip()[:240]
         fail(message or 'That part could not be opened.', 502)
-    return FileResponse(path, media_type='video/mp4')
+
+    def chunks():
+        try:
+            yield first
+            while True:
+                block = proc.stdout.read(64 * 1024) if proc.stdout else b''
+                if not block:
+                    break
+                yield block
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=3)
+
+    return StreamingResponse(chunks(), media_type='video/mp4', headers={'Cache-Control': 'no-store', 'Accept-Ranges': 'none'})
+
+
+@app.get('/api/frame')
+def frame(url: str, at: float | None = None):
+    page = youtube_url(url)
+    try:
+        path, point, duration = grab_frame(page, at)
+    except Exception as exc:
+        message = re.sub(r'https?://\S+', '', clean(str(exc))).strip()[:240]
+        fail(message or 'That frame could not be opened.', 502)
+    return FileResponse(path, media_type='image/jpeg', headers={
+        'Cache-Control': 'private, max-age=3600',
+        'X-Duration': f'{duration:.3f}',
+        'X-At': f'{point:.3f}',
+    })
 
 
 @app.get('/api/health')

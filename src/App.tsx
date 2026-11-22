@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type FormEvent, type PointerEvent, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import logo from '../gta6.png'
 
@@ -126,20 +126,347 @@ function momentKey(clip: { start: number; end: number }) {
   return `${clip.start}-${clip.end}`
 }
 
+type LayoutName = 'blur' | 'full' | 'split'
+type Region = { x: number; y: number; w: number; h: number }
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value))
+}
+
+// Each half of the 9:16 reel is 9:8. On the 16:9 source frame, that is this width/height.
+const SPLIT_RATIO = (9 / 8) / (16 / 9)
+
+function round4(value: number) {
+  return Math.round(value * 10000) / 10000
+}
+
+function lockSplit(box: Region): Region {
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  let height = clamp(box.h, 0.28, 1)
+  let width = height * SPLIT_RATIO
+  if (width > 1) {
+    width = 1
+    height = width / SPLIT_RATIO
+  }
+  const x = clamp(cx - width / 2, 0, 1 - width)
+  const y = clamp(cy - height / 2, 0, 1 - height)
+  return { x: round4(x), y: round4(y), w: round4(width), h: round4(height) }
+}
+
+function resizeSplit(origin: Region, dx: number, dy: number): Region {
+  const fromWidth = Math.abs(dx) >= Math.abs(dy)
+  let width = fromWidth ? origin.w + dx : (origin.h + dy) * SPLIT_RATIO
+  const maxW = Math.max(0.12, 1 - origin.x)
+  const maxH = Math.max(0.12, 1 - origin.y)
+  const fitW = Math.min(maxW, maxH * SPLIT_RATIO)
+  width = clamp(width, Math.min(0.22, fitW), fitW)
+  return { x: origin.x, y: origin.y, w: round4(width), h: round4(width / SPLIT_RATIO) }
+}
+
+function cropStyle(image: string, box: Region): CSSProperties {
+  const w = clamp(box.w, 0.12, 1)
+  const h = clamp(box.h, 0.12, 1)
+  const x = clamp(box.x, 0, 1 - w)
+  const y = clamp(box.y, 0, 1 - h)
+  const posX = w >= 0.999 ? '0%' : `${(x / (1 - w)) * 100}%`
+  const posY = h >= 0.999 ? '0%' : `${(y / (1 - h)) * 100}%`
+  const safe = image.replace(/"/g, '')
+  return {
+    backgroundImage: safe ? `url("${safe}")` : undefined,
+    backgroundSize: `${100 / w}% ${100 / h}%`,
+    backgroundPosition: `${posX} ${posY}`,
+    backgroundRepeat: 'no-repeat',
+  }
+}
+
+function RegionFrame({ image, regions, onChange }: { image: string; regions: [Region, Region]; onChange: (next: [Region, Region]) => void }) {
+  const frame = useRef<HTMLDivElement>(null)
+  function drag(index: 0 | 1, event: PointerEvent<HTMLElement>, mode: 'move' | 'resize') {
+    const host = frame.current
+    if (!host) return
+    event.preventDefault()
+    event.stopPropagation()
+    const bounds = host.getBoundingClientRect()
+    const origin = regions[index]
+    const startX = event.clientX
+    const startY = event.clientY
+    const move = (ev: globalThis.PointerEvent) => {
+      const dx = (ev.clientX - startX) / bounds.width
+      const dy = (ev.clientY - startY) / bounds.height
+      const next = regions.map((box, item) => {
+        if (item !== index) return box
+        if (mode === 'resize') return resizeSplit(origin, dx, dy)
+        return { ...origin, x: clamp(origin.x + dx, 0, 1 - origin.w), y: clamp(origin.y + dy, 0, 1 - origin.h) }
+      }) as [Region, Region]
+      onChange(next)
+    }
+    const stop = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', stop)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop)
+  }
+  return (
+    <div className="region-frame" ref={frame}>
+      {image ? <img src={image} alt="" /> : <div className="region-empty" />}
+      {regions.map((box, index) => (
+        <div
+          key={index}
+          className={index === 0 ? 'region top' : 'region bottom'}
+          style={{ left: `${box.x * 100}%`, top: `${box.y * 100}%`, width: `${box.w * 100}%`, height: `${box.h * 100}%` }}
+          onPointerDown={(event) => drag(index as 0 | 1, event, 'move')}
+        >
+          <span>{index === 0 ? 'Top' : 'Bottom'}</span>
+          <button type="button" aria-label={index === 0 ? 'Resize the top section' : 'Resize the bottom section'} onPointerDown={(event) => drag(index as 0 | 1, event, 'resize')} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function scoreOf(clip: Clip) {
   return clip.heat ?? clip.youtube ?? clip.tiktok ?? clip.instagram ?? 0
 }
 
-type PlayMark = { start: number; end: number; nonce: number }
+function passingIndexes(clips: Clip[], score: number) {
+  return clips.flatMap((clip, index) => scoreOf(clip) >= score ? [index] : [])
+}
 
-function SourcePlayer({ pageUrl, play, poster }: { pageUrl: string; play: PlayMark | null; poster: string }) {
+type PlayMark = { start: number; end: number; nonce: number; hook: string; caption: string; showTitle: boolean; showCaptions: boolean }
+
+type Paintable = CanvasImageSource & { videoWidth?: number; naturalWidth?: number; videoHeight?: number; naturalHeight?: number }
+
+function sourceSize(media: Paintable) {
+  return {
+    width: media.videoWidth || media.naturalWidth || 0,
+    height: media.videoHeight || media.naturalHeight || 0,
+  }
+}
+
+function paintLayout(ctx: CanvasRenderingContext2D, media: Paintable, layout: LayoutName, regions: [Region, Region], width: number, height: number) {
+  const { width: sw, height: sh } = sourceSize(media)
+  if (!sw || !sh) return
+  ctx.clearRect(0, 0, width, height)
+  const cover = (box: Region | null, dx: number, dy: number, dw: number, dh: number) => {
+    const sx = (box ? box.x : 0) * sw
+    const sy = (box ? box.y : 0) * sh
+    const cw = Math.max(1, (box ? box.w : 1) * sw)
+    const ch = Math.max(1, (box ? box.h : 1) * sh)
+    const scale = Math.max(dw / cw, dh / ch)
+    const visW = dw / scale
+    const visH = dh / scale
+    ctx.drawImage(media, sx + (cw - visW) / 2, sy + (ch - visH) / 2, visW, visH, dx, dy, dw, dh)
+  }
+  if (layout === 'full') {
+    cover(null, 0, 0, width, height)
+    return
+  }
+  if (layout === 'split') {
+    cover(regions[0], 0, 0, width, height / 2)
+    cover(regions[1], 0, height / 2, width, height / 2)
+    return
+  }
+  ctx.save()
+  ctx.filter = 'blur(18px)'
+  cover(null, width * -0.08, height * -0.08, width * 1.16, height * 1.16)
+  ctx.restore()
+  const band = width * (sh / sw)
+  ctx.drawImage(media, 0, (height - band) / 2, width, band)
+}
+
+function useLiveFrame(pageUrl: string, on: boolean, fallbackEnd: number) {
+  const [shown, setShown] = useState(0)
+  const [asked, setAsked] = useState<number | null>(null)
+  const [duration, setDuration] = useState(0)
+  const [image, setImage] = useState('')
+  const [note, setNote] = useState('')
+  const touched = useRef(false)
+  const ticket = useRef(0)
+
+  useEffect(() => {
+    touched.current = false
+    setAsked(null)
+    setShown(0)
+    setDuration(0)
+    setImage('')
+    setNote('')
+  }, [pageUrl])
+
+  useEffect(() => {
+    if (!touched.current) return
+    const timer = window.setTimeout(() => setAsked(shown), 350)
+    return () => window.clearTimeout(timer)
+  }, [shown])
+
+  useEffect(() => {
+    if (!on || !pageUrl) return
+    const id = ++ticket.current
+    const controller = new AbortController()
+    setNote('Opening a frame from the video.')
+    const params = new URLSearchParams({ url: pageUrl })
+    if (asked !== null) params.set('at', String(Math.round(asked)))
+    const finish = (next: string, point: number, length: number) => {
+      if (id !== ticket.current) return
+      setImage((prev) => {
+        if (prev.startsWith('blob:')) URL.revokeObjectURL(prev)
+        return next
+      })
+      if (length > 0) setDuration(length)
+      if (!touched.current) setShown(point)
+      setNote('')
+    }
+    const snapshot = (start: number, length: number) => {
+      const video = document.createElement('video')
+      video.muted = true
+      video.playsInline = true
+      video.preload = 'auto'
+      video.src = `/api/preview?url=${encodeURIComponent(pageUrl)}&start=${start}&end=${start + 1.5}`
+      const drop = () => {
+        video.onloadeddata = null
+        video.onerror = null
+        video.src = ''
+      }
+      video.onerror = () => {
+        drop()
+        if (id === ticket.current) setNote('This frame could not be opened.')
+      }
+      video.onloadeddata = () => {
+        const canvas = document.createElement('canvas')
+        canvas.width = video.videoWidth || 640
+        canvas.height = video.videoHeight || 360
+        canvas.getContext('2d')?.drawImage(video, 0, 0)
+        drop()
+        canvas.toBlob((blob) => {
+          if (!blob || id !== ticket.current) return
+          finish(URL.createObjectURL(blob), start, length)
+        }, 'image/jpeg', 0.82)
+      }
+      return drop
+    }
+    let dropSnapshot = () => {}
+    let cancelled = false
+    void fetch(`/api/frame?${params}`, { signal: controller.signal })
+      .then(async (res) => {
+        if (cancelled || id !== ticket.current) return
+        if (!res.ok) throw new Error('frame')
+        const length = Number(res.headers.get('X-Duration') || 0)
+        const point = Number(res.headers.get('X-At') || asked || 0)
+        const blob = await res.blob()
+        if (cancelled || id !== ticket.current) return
+        finish(URL.createObjectURL(blob), point, length)
+      })
+      .catch(() => {
+        if (cancelled || id !== ticket.current || controller.signal.aborted) return
+        const length = fallbackEnd > 1 ? fallbackEnd : 0
+        const start = asked ?? (length > 1 ? length / 2 : 0)
+        if (length < 1 && asked === null) {
+          setNote('Find the moments, then move through the video to place the two sections.')
+          return
+        }
+        dropSnapshot = snapshot(Math.max(0, start), length || fallbackEnd)
+      })
+    return () => {
+      cancelled = true
+      controller.abort()
+      dropSnapshot()
+    }
+  }, [on, pageUrl, asked, fallbackEnd])
+
+  return {
+    image,
+    shown,
+    duration: duration || fallbackEnd,
+    note,
+    move(value: number) {
+      touched.current = true
+      setShown(value)
+    },
+  }
+}
+
+function SourcePlayer({
+  pageUrl, play, layout, regions, still,
+}: {
+  pageUrl: string
+  play: PlayMark | null
+  layout: LayoutName
+  regions: [Region, Region]
+  still: string
+}) {
   const node = useRef<HTMLVideoElement>(null)
+  const board = useRef<HTMLCanvasElement>(null)
+  const stillNode = useRef<HTMLImageElement | null>(null)
+  const drawRef = useRef<() => void>(() => {})
   const [note, setNote] = useState('Play a moment to watch that part here.')
+  const [playing, setPlaying] = useState(false)
+  const [muted, setMuted] = useState(false)
+  const [time, setTime] = useState(0)
+  const [duration, setDuration] = useState(0)
   const src = play ? `/api/preview?url=${encodeURIComponent(pageUrl)}&start=${play.start}&end=${play.end}` : ''
+  useEffect(() => {
+    if (!still) {
+      stillNode.current = null
+      drawRef.current()
+      return
+    }
+    const img = new Image()
+    img.onload = () => {
+      stillNode.current = img
+      drawRef.current()
+    }
+    img.src = still
+  }, [still])
+  useEffect(() => {
+    const canvas = board.current
+    const video = node.current
+    if (!canvas) return
+    let raf = 0
+    let alive = true
+    const draw = () => {
+      if (!alive) return
+      const ctx = canvas.getContext('2d')
+      const rect = canvas.getBoundingClientRect()
+      if (!ctx || rect.width < 2) return
+      const dpr = Math.min(2, window.devicePixelRatio || 1)
+      const width = Math.round(rect.width * dpr)
+      const height = Math.round(rect.height * dpr)
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width
+        canvas.height = height
+      }
+      const media = video && video.readyState >= 2 ? video : stillNode.current
+      if (media) paintLayout(ctx, media, layout, regions, width, height)
+    }
+    drawRef.current = draw
+    const loop = () => {
+      draw()
+      if (video && !video.paused && !video.ended) raf = requestAnimationFrame(loop)
+    }
+    loop()
+    const onPlay = () => {
+      cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(loop)
+    }
+    video?.addEventListener('play', onPlay)
+    video?.addEventListener('seeked', draw)
+    video?.addEventListener('loadeddata', draw)
+    return () => {
+      alive = false
+      cancelAnimationFrame(raf)
+      video?.removeEventListener('play', onPlay)
+      video?.removeEventListener('seeked', draw)
+      video?.removeEventListener('loadeddata', draw)
+    }
+  }, [layout, regions, play, still])
   useEffect(() => {
     const video = node.current
     if (!video || !play) {
       setNote('Play a moment to watch that part here.')
+      setPlaying(false)
+      setTime(0)
+      setDuration(0)
       return
     }
     const span = `${play.start}-${play.end}`
@@ -163,27 +490,90 @@ function SourcePlayer({ pageUrl, play, poster }: { pageUrl: string; play: PlayMa
       video.removeEventListener('error', onError)
     }
   }, [play])
+  function seek(value: number) {
+    const video = node.current
+    if (!video || !duration) return
+    const next = Math.min(duration, Math.max(0, value))
+    video.currentTime = next
+    setTime(next)
+  }
   return (
-    <div className="source-stage">
-      {src ? (
-        <video key={src} ref={node} src={src} poster={poster || undefined} controls playsInline preload="auto" />
-      ) : poster ? (
-        <img className="source-poster" src={poster} alt="" />
-      ) : null}
-      {note && <p className="source-note">{note}</p>}
+    <div className="source-reel">
+      <div className={`phone layout-${layout} source-live`}>
+        <canvas ref={board} />
+        {src && (
+          <video
+            key={src}
+            ref={node}
+            className="source-media"
+            src={src}
+            playsInline
+            preload="auto"
+            onTimeUpdate={() => setTime(node.current?.currentTime || 0)}
+            onDurationChange={() => setDuration(Number.isFinite(node.current?.duration) ? node.current!.duration : 0)}
+            onPlay={() => setPlaying(true)}
+            onPause={() => setPlaying(false)}
+          />
+        )}
+        {play?.showTitle && play.hook && <p className="hook">{maskText(play.hook)}</p>}
+        {play?.showCaptions && play.caption && <p className="cap">{maskText(play.caption)}</p>}
+        {note && <p className="source-note">{note}</p>}
+      </div>
+      <div className="source-bar">
+        <input
+          className="reel-seek"
+          type="range"
+          min={0}
+          max={duration || 0}
+          step={0.05}
+          value={Math.min(time, duration || 0)}
+          aria-label="Move through this moment"
+          aria-valuetext={`${clock(time)} of ${clock(duration)}`}
+          disabled={!duration}
+          style={{ ['--fill' as string]: `${duration ? (time / duration) * 100 : 0}%` }}
+          onInput={(event) => seek(Number(event.currentTarget.value))}
+        />
+        <div className="reel-controls">
+          <div className="reel-meta">
+            <button type="button" aria-label={playing ? 'Pause' : 'Play'} disabled={!src} onClick={() => {
+              const video = node.current
+              if (!video) return
+              if (video.paused) void video.play().catch(() => setNote('Press play on the video.'))
+              else video.pause()
+            }}>
+              <PlayerIcon name={playing ? 'pause' : 'play'} />
+            </button>
+            <span className="reel-time">{clock(time)} / {clock(duration)}</span>
+          </div>
+          <div className="reel-actions">
+            <button type="button" aria-label={muted ? 'Unmute' : 'Mute'} disabled={!src} onClick={() => {
+              const video = node.current
+              if (!video) return
+              video.muted = !video.muted
+              setMuted(video.muted)
+            }}>
+              <PlayerIcon name={muted ? 'mute' : 'sound'} />
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
 
 function MomentCard({
-  item, image, on, captions, onToggle, onCaptions, onPlay,
+  item, image, on, captions, showTitle, layout, regions, onToggle, onCaptions, onTitle, onPlay,
 }: {
   item: Clip
   image: string
   on: boolean
   captions: boolean
+  showTitle: boolean
+  layout: LayoutName
+  regions: [Region, Region]
   onToggle: () => void
   onCaptions: () => void
+  onTitle: () => void
   onPlay: () => void
 }) {
   const [open, setOpen] = useState(false)
@@ -199,10 +589,19 @@ function MomentCard({
       transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
     >
       <div className="moment-reel">
-        <div className="phone">
-          <div className="wash" style={safe ? { backgroundImage: `url("${safe}")` } : undefined} />
-          {safe ? <img className="sharp" src={safe} alt="" /> : <div className="sharp blank" />}
-          <p className="hook">{maskText(item.hook)}</p>
+        <div className={`phone layout-${layout}`}>
+          {layout === 'split' ? (
+            <>
+              <div className="split-band top" style={cropStyle(safe, regions[0])} />
+              <div className="split-band bottom" style={cropStyle(safe, regions[1])} />
+            </>
+          ) : (
+            <>
+              <div className="wash" style={safe ? { backgroundImage: `url("${safe}")` } : undefined} />
+              {safe ? <img className="sharp" src={safe} alt="" /> : <div className="sharp blank" />}
+            </>
+          )}
+          {showTitle && <p className="hook">{maskText(item.hook)}</p>}
           {captions && item.lines[0]?.text && <p className="cap">{maskText(item.lines[0].text)}</p>}
           <button className="moment-play" type="button" aria-label={`Play ${maskText(item.title)}`} onClick={onPlay}>
             <PlayerIcon name="play" />
@@ -229,6 +628,10 @@ function MomentCard({
           <label>
             <input type="checkbox" checked={captions} onChange={onCaptions} />
             Show captions
+          </label>
+          <label>
+            <input type="checkbox" checked={showTitle} onChange={onTitle} />
+            Show title
           </label>
         </div>
       </div>
@@ -590,10 +993,25 @@ export function App() {
   const [models, setModels] = useState<Model[]>([])
   const [model, setModel] = useState('')
   const [query, setQuery] = useState('')
-  const [momentFilter, setMomentFilter] = useState<'all' | 'high' | 'kept'>('all')
+  const [scoreCut, setScoreCut] = useState(80)
+  const [momentFilter, setMomentFilter] = useState<'all' | 'kept'>('all')
   const [momentSort, setMomentSort] = useState<'score' | 'time'>('score')
   const [playMark, setPlayMark] = useState<PlayMark | null>(null)
   const [captionOn, setCaptionOn] = useState<Record<string, boolean>>({})
+  const [titleOn, setTitleOn] = useState<Record<string, boolean>>({})
+  const [layout, setLayout] = useState<LayoutName>('blur')
+  const [regions, setRegions] = useState<[Region, Region]>([
+    lockSplit({ x: 0.04, y: 0.04, w: 0.4, h: 0.62 }),
+    lockSplit({ x: 0.56, y: 0.34, w: 0.4, h: 0.62 }),
+  ])
+  useEffect(() => {
+    if (layout !== 'split') return
+    setRegions((current) => {
+      const next = current.map((box) => lockSplit(box)) as [Region, Region]
+      const same = next.every((box, index) => box.x === current[index].x && box.y === current[index].y && box.w === current[index].w && box.h === current[index].h)
+      return same ? current : next
+    })
+  }, [layout])
   const [url, setUrl] = useState('')
   const [note, setNote] = useState(NOTES.google)
   const [modelWarn, setModelWarn] = useState(false)
@@ -602,6 +1020,8 @@ export function App() {
   const [loadingModels, setLoadingModels] = useState(false)
   const [job, setJob] = useState<Job | null>(null)
   const [clips, setClips] = useState<Clip[]>([])
+  const furthest = clips.reduce((end, clip) => Math.max(end, clip.end), 0)
+  const frame = useLiveFrame(url.trim(), layout === 'split' && Boolean(youtubeId(url)), furthest)
   const [film, setFilm] = useState('')
   const [source, setSource] = useState<Source>({})
   const [thumb, setThumb] = useState('')
@@ -756,12 +1176,13 @@ export function App() {
         if (next.status === 'done') {
           const found = next.clips || []
           setClips(found)
-          setChosen(found.map((_, index) => index))
+          setChosen(passingIndexes(found, scoreCut))
           setFilm(next.title || '')
           setThumb(next.thumbnail || '')
           if (next.source) setSource(next.source)
           setVideos([])
           setCaptionOn({})
+          setTitleOn({})
           setPlayMark(null)
         }
       })
@@ -814,7 +1235,7 @@ export function App() {
   }, [openExport])
 
   async function cutChosen() {
-    const items = chosen.map((index) => clips[index]).filter(Boolean)
+    const items = chosen.map((index) => clips[index]).filter((clip) => clip && scoreOf(clip) >= scoreCut)
     if (busy || items.length === 0) return
     setBusy(true)
     setVideos([])
@@ -836,7 +1257,10 @@ export function App() {
           title: clip.title,
           why: clip.why,
           captions: captionOn[momentKey(clip)] !== false,
+          show_title: titleOn[momentKey(clip)] !== false,
         })),
+        layout,
+        splits: regions,
         film,
         source,
         export_dir: folder,
@@ -919,9 +1343,75 @@ export function App() {
           />
           <p className={modelWarn ? 'hint warn' : 'hint'}>{modelNote}</p>
         </Field>
-        <Field label="Find a specific moment">
-          <input id="query" type="text" value={query} placeholder="The plane on the runway" onChange={(event) => setQuery(event.target.value)} />
-        </Field>
+        <div className="pair">
+          <Field label="Find a specific moment">
+            <input id="query" type="text" value={query} placeholder="The plane on the runway" onChange={(event) => setQuery(event.target.value)} />
+          </Field>
+          <Field label="Score">
+            <input
+              id="score"
+              type="number"
+              min={0}
+              max={99}
+              inputMode="numeric"
+              value={scoreCut}
+              onChange={(event) => {
+                const next = Number(event.target.value)
+                if (!Number.isFinite(next)) return
+                setScoreCut(Math.max(0, Math.min(99, Math.round(next))))
+              }}
+            />
+          </Field>
+        </div>
+        <p className="hint">Moments at or above this score stay on the board. Set it to 0 to see every moment.</p>
+        <div className="layouts">
+          <span className="label">Layout</span>
+          <div className="layout-row" role="radiogroup" aria-label="Reel layout">
+            {([
+              ['blur', 'Blurred game'],
+              ['full', 'Full screen'],
+              ['split', 'Two splits'],
+            ] as const).map(([id, name]) => (
+              <button key={id} type="button" role="radio" aria-checked={layout === id} className={layout === id ? 'layout-pick on' : 'layout-pick'} onClick={() => setLayout(id)}>
+                <span className={`layout-mini ${id}`} aria-hidden="true" />
+                <span>{name}</span>
+              </button>
+            ))}
+          </div>
+          {layout === 'split' && (
+            <div className="split-setup">
+              <div className="split-pick">
+                <RegionFrame image={frame.image} regions={regions} onChange={setRegions} />
+                <label className="frame-point">
+                  <span>Frame at {clock(frame.shown)}</span>
+                  <input
+                    className="reel-seek"
+                    type="range"
+                    min={0}
+                    max={frame.duration || 0}
+                    step={1}
+                    value={Math.min(frame.shown, frame.duration || 0)}
+                    aria-label="Choose the frame used to place the two sections"
+                    aria-valuetext={clock(frame.shown)}
+                    disabled={!frame.duration}
+                    style={{ ['--fill' as string]: `${frame.duration ? (frame.shown / frame.duration) * 100 : 0}%` }}
+                    onInput={(event) => frame.move(Number(event.currentTarget.value))}
+                  />
+                </label>
+                {frame.note && <p className="hint">{frame.note}</p>}
+              </div>
+              <div className="phone layout-split source-sample" aria-hidden="true">
+                <div className="split-band top" style={cropStyle(frame.image, regions[0])} />
+                <div className="split-band bottom" style={cropStyle(frame.image, regions[1])} />
+              </div>
+            </div>
+          )}
+          <p className="hint">
+            {layout === 'blur' && 'The sharp game sits in the middle. The rest of the reel is a soft copy of the same picture.'}
+            {layout === 'full' && 'The game fills the whole reel.'}
+            {layout === 'split' && 'Drag the two boxes. They stay the shape of one half of the reel. Move the slider when the person walks out of a box.'}
+          </p>
+        </div>
         </motion.div>
         <motion.button className="primary" type="submit" disabled={busy} variants={rise} whileHover={busy ? undefined : { y: -1 }} whileTap={{ scale: 0.985 }}>
           {busy ? 'Working' : 'Find the moments'}
@@ -940,15 +1430,27 @@ export function App() {
             {film && <p className="film">{film}</p>}
           </div>
           {clips.length > 0 && (
-            <button className="texty" type="button" onClick={() => setChosen(chosen.length === clips.length ? [] : clips.map((_, index) => index))}>
-              {chosen.length === clips.length ? 'Clear' : 'Select all'}
+            <button className="texty" type="button" onClick={() => {
+              const passing = passingIndexes(clips, scoreCut)
+              const allOn = passing.length > 0 && passing.every((index) => chosen.includes(index))
+              setChosen(allOn ? chosen.filter((index) => !passing.includes(index)) : [...new Set([...chosen, ...passing])].sort((a, b) => a - b))
+            }}>
+              {passingIndexes(clips, scoreCut).length > 0 && passingIndexes(clips, scoreCut).every((index) => chosen.includes(index)) ? 'Clear' : 'Select all'}
             </button>
           )}
         </motion.div>
-        {youtubeId(url) && <SourcePlayer pageUrl={url.trim()} play={playMark} poster={thumb} />}
+        {youtubeId(url) && (
+          <SourcePlayer
+            pageUrl={url.trim()}
+            play={playMark}
+            layout={layout}
+            regions={regions}
+            still={layout === 'split' ? frame.image : thumb}
+          />
+        )}
         {clips.length > 0 && (
           <div className="moment-filters" role="toolbar" aria-label="Filter moments">
-            {([['all', 'All'], ['high', 'Score ≥ 80'], ['kept', 'Kept']] as const).map(([id, label]) => (
+            {([['all', 'All'], ['kept', 'Kept']] as const).map(([id, label]) => (
               <button key={id} type="button" className={momentFilter === id ? 'on' : ''} aria-pressed={momentFilter === id} onClick={() => setMomentFilter(id)}>
                 {label}
               </button>
@@ -959,6 +1461,9 @@ export function App() {
           </div>
         )}
         {clips.length === 0 && !busy && <motion.p className="empty" variants={rise}>Paste a link and find the moments. They leave when you reload this page.</motion.p>}
+        {clips.length > 0 && clips.every((item) => scoreOf(item) < scoreCut) && (
+          <p className="empty">Nothing scored {scoreCut} or higher. Lower the score to see the rest.</p>
+        )}
         {clips.length === 0 && busy && (
           <div className="moment-list" aria-hidden="true">
             {[0, 1, 2].map((index) => <article className="moment moment-ghost" key={index} />)}
@@ -968,7 +1473,7 @@ export function App() {
           <AnimatePresence>
             {clips.map((item, index) => ({ item, index }))
               .filter(({ item, index }) => {
-                if (momentFilter === 'high' && scoreOf(item) < 80) return false
+                if (scoreOf(item) < scoreCut) return false
                 if (momentFilter === 'kept' && !chosen.includes(index)) return false
                 return true
               })
@@ -982,12 +1487,24 @@ export function App() {
                   image={item.thumb || thumb}
                   on={chosen.includes(index)}
                   captions={captionOn[key] !== false}
+                  showTitle={titleOn[key] !== false}
+                  layout={layout}
+                  regions={regions}
                   onToggle={() => toggle(index)}
                   onCaptions={() => setCaptionOn((current) => ({ ...current, [key]: current[key] === false }))}
+                  onTitle={() => setTitleOn((current) => ({ ...current, [key]: current[key] === false }))}
                   onPlay={() => {
-                    setPlayMark({ start: item.start, end: item.end, nonce: Date.now() })
+                    setPlayMark({
+                      start: item.start,
+                      end: item.end,
+                      nonce: Date.now(),
+                      hook: item.hook,
+                      caption: item.lines[0]?.text || '',
+                      showTitle: titleOn[key] !== false,
+                      showCaptions: captionOn[key] !== false,
+                    })
                     const motion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-                    document.querySelector('.source-stage')?.scrollIntoView({ behavior: motion ? 'auto' : 'smooth', block: 'nearest' })
+                    document.querySelector('.source-reel')?.scrollIntoView({ behavior: motion ? 'auto' : 'smooth', block: 'nearest' })
                   }}
                 />
               )
