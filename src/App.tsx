@@ -1565,16 +1565,14 @@ export function App() {
                   </button>
                 </div>
                 <div className="copy-list">
-                  {openExport.poster && <img className="poster" src={openExport.poster} alt="" />}
-                  {openExport.folder && <CopyCard kind="file" label="Folder" text={openExport.folder} />}
-                  {openExport.path && <CopyCard kind="file" label="Video" text={openExport.path} />}
-                  {openExport.thumb_path && <CopyCard kind="file" label="Thumbnail" text={openExport.thumb_path} />}
-                  {openExport.meta_path && <CopyCard kind="file" label="Meta file" text={openExport.meta_path} />}
-                  {openExport.tags && <CopyCard kind="youtube" label="YouTube tags" text={maskText(openExport.tags)} />}
-                  {openExport.instagram && <CopyCard kind="instagram" label="Instagram caption" text={maskText(openExport.instagram)} />}
                   {openExport.youtube_title && <CopyCard kind="youtube" label="YouTube title" text={maskText(openExport.youtube_title)} />}
                   {openExport.youtube && <CopyCard kind="youtube" label="YouTube description" text={maskText(openExport.youtube)} />}
+                  {openExport.tags && <CopyCard kind="youtube" label="YouTube tags" text={maskText(openExport.tags)} />}
+                  {openExport.instagram && <CopyCard kind="instagram" label="Instagram caption" text={maskText(openExport.instagram)} />}
                   {openExport.tiktok && <CopyCard kind="tiktok" label="TikTok caption" text={maskText(openExport.tiktok)} />}
+                  {openExport.folder && <CopyCard kind="file" label="Folder" text={openExport.folder} />}
+                  {openExport.path && <CopyCard kind="file" label="Video" text={openExport.path} />}
+                  {openExport.meta_path && <CopyCard kind="file" label="Meta file" text={openExport.meta_path} />}
                 </div>
               </div>
             </motion.div>

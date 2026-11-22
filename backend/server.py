@@ -1430,9 +1430,9 @@ def tag_extras(source: dict, title: str, hook: str) -> list[str]:
     return extras
 
 
-def fallback_pack(title: str, hook: str, film: str, duration: float, source: dict | None = None) -> dict:
+def fallback_pack(title: str, hook: str, film: str, source: dict | None = None) -> dict:
     seeds = [title, hook, film, 'funny moment', 'shorts', 'youtube shorts']
-    return {'second': round(max(0.4, min(duration - 0.4, duration * 0.42)), 2), 'tags': fill_tags(','.join(seeds), tag_extras(source or {}, title, hook))}
+    return {'tags': fill_tags(','.join(seeds), tag_extras(source or {}, title, hook))}
 
 
 def pack_prompt(film: str, clips: list[dict], source: dict) -> str:
@@ -1443,8 +1443,7 @@ def pack_prompt(film: str, clips: list[dict], source: dict) -> str:
     origin_tags = ', '.join(source.get('tags') or [])[:400]
     return (
         'You package one YouTube Short the way a large channel would, without lying.\n'
-        'Return JSON only: {"packs":[{"index":0,"second":1.5,"tags":"tag one,tag two","youtube_title":"","youtube":"","instagram":"","tiktok":""}]}\n'
-        'second is the single craziest moment inside that clip, in seconds from the clip start. Stay inside the clip.\n'
+        'Return JSON only: {"packs":[{"index":0,"tags":"tag one,tag two","youtube_title":"","youtube":"","instagram":"","tiktok":""}]}\n'
         'tags is one string of search phrases, biggest and most exact first. No hash sign. Separate tags with commas and no spaces after the commas.\n'
         'The tags string must be at least 470 characters and at most 500, including the commas. Do not stop early.\n'
         'Order the tags: the exact phrase a stranger would type for this moment, close wordings, common misspellings, the channel name, phrases from the source title, source tags that still match this clip, then broader searches.\n'
@@ -1466,19 +1465,6 @@ def read_packs(provider: str, key: str, model: str, film: str, clips: list[dict]
     raw = parse_json(ask(provider, key, model, pack_prompt(film, clips, source), on_tokens, tokens=3200, temperature=0.5))
     found = raw.get('packs') if isinstance(raw, dict) else None
     return found if isinstance(found, list) else []
-
-
-def grab_thumb(src: Path, at: float, dest: Path):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(RENDER), '-y', '-hide_banner', '-loglevel', 'error',
-        '-ss', f'{max(0.0, at):.3f}', '-i', str(src), '-frames:v', '1',
-        '-vf', 'scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720',
-        str(dest),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    if proc.returncode != 0 or not dest.is_file():
-        raise RuntimeError(clean((proc.stderr or 'The thumbnail frame failed.')[-240:]))
 
 
 def unique_pack(folder: Path, stem: str) -> Path:
@@ -1564,13 +1550,12 @@ def attract(title: str, hook: str, why: str, film: str, spoken: str = '', channe
 
 def write_meta(path: Path, copy: dict, video: Path):
     path.write_text(
-        f"TITLE\n{copy['title']}\n\n"
-        f"INSTAGRAM\n{copy['instagram']}\n\n"
         f"YOUTUBE TITLE\n{copy['youtube_title']}\n\n"
         f"YOUTUBE DESCRIPTION\n{copy['youtube']}\n\n"
-        f"TIKTOK\n{copy['tiktok']}\n\n"
         f"YOUTUBE TAGS\n{copy.get('tags') or ''}\n\n"
-        f"THUMBNAIL\n{copy.get('thumbnail') or ''}\n\n"
+        f"INSTAGRAM\n{copy['instagram']}\n\n"
+        f"TIKTOK\n{copy['tiktok']}\n\n"
+        f"TITLE\n{copy['title']}\n\n"
         f"FILE\n{video}\n",
         encoding='utf-8',
     )
@@ -1693,35 +1678,23 @@ def run_cut(job_id: str, body: dict):
                 update(job_id, progress=round(base + span * 0.9, 3), step=f'Packing {index + 1} of {total}', detail='The model is writing the title, the description, and the tags.')
                 try:
                     def take_tokens(extra, job_id=job_id):
-                        charge(job_id, provider, model, extra, 'tags and thumbnail')
+                        charge(job_id, provider, model, extra, 'title, description, and tags')
                     packs = read_packs(provider, key, model, film, [{
                         'title': title, 'hook': hook, 'why': str(clip.get('why') or ''), 'lines': lines,
                     }], source, take_tokens)
                 except Exception:
                     packs = []
             chosen = packs[0] if packs and isinstance(packs[0], dict) else {}
-            try:
-                second = float(chosen.get('second'))
-            except (TypeError, ValueError):
-                second = duration * 0.42
-            second = max(0.2, min(max(0.2, duration - 0.2), second))
-            tags = fill_tags(str(chosen.get('tags') or ''), tag_extras(source, title, hook)) or fallback_pack(title, hook, film, duration, source)['tags']
+            tags = fill_tags(str(chosen.get('tags') or ''), tag_extras(source, title, hook)) or fallback_pack(title, hook, film, source)['tags']
             spoken = ' '.join(str(line.get('text') or '') for line in lines)[:400]
             copy = attract(title, hook, str(clip.get('why') or ''), film, spoken, str(source.get('channel') or ''), chosen)
             copy['tags'] = tags
             pack = unique_pack(folder, clip_slug(copy['title']))
             dest = pack / 'video.mp4'
-            thumb = pack / 'thumbnail.png'
             meta = pack / 'meta.txt'
             shutil.move(out, dest)
-            try:
-                grab_thumb(src, pad + second, thumb)
-            except Exception:
-                thumb = pack / 'thumbnail.png'
-            if thumb.is_file():
-                copy['thumbnail'] = str(thumb)
             write_meta(meta, copy, dest)
-            item = saved_reel(folder, pack.name, dest, meta, thumb if thumb.is_file() else None, 'video')
+            item = saved_reel(folder, pack.name, dest, meta, None, 'video')
             item['quality'] = quality
             item['start'] = start
             files.append(item)
