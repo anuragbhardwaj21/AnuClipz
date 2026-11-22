@@ -9,6 +9,7 @@ type Clip = {
   hook: string
   title: string
   why: string
+  heat?: number
   instagram: number | null
   youtube: number | null
   tiktok: number | null
@@ -111,6 +112,95 @@ function clock(value: number) {
   const seconds = total % 60
   const body = `${minutes}:${String(seconds).padStart(2, '0')}`
   return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}` : body
+}
+
+function youtubeId(value: string) {
+  const text = value.trim()
+  const short = text.match(/youtu\.be\/([\w-]{6,})/)
+  if (short) return short[1]
+  const watch = text.match(/[?&]v=([\w-]{6,})/)
+  return watch ? watch[1] : ''
+}
+
+function momentKey(clip: { start: number; end: number }) {
+  return `${clip.start}-${clip.end}`
+}
+
+function scoreOf(clip: Clip) {
+  return clip.heat ?? clip.youtube ?? clip.tiktok ?? clip.instagram ?? 0
+}
+
+type PlayMark = { start: number; end: number; nonce: number }
+type YTPlayer = {
+  seekTo: (seconds: number, allowSeekAhead: boolean) => void
+  playVideo: () => void
+  pauseVideo: () => void
+  getCurrentTime: () => number
+  destroy: () => void
+}
+
+function SourcePlayer({ videoId, play }: { videoId: string; play: PlayMark | null }) {
+  const frame = useRef<HTMLDivElement>(null)
+  const player = useRef<YTPlayer | null>(null)
+  useEffect(() => {
+    const host = frame.current
+    if (!host) return
+    let dead = false
+    const slot = document.createElement('div')
+    host.replaceChildren(slot)
+    const mount = () => {
+      const YT = (window as unknown as { YT?: { Player: new (el: HTMLElement, opts: object) => YTPlayer } }).YT
+      if (dead || !YT?.Player || player.current) return
+      player.current = new YT.Player(slot, {
+        videoId,
+        playerVars: { rel: 0, modestbranding: 1, playsinline: 1 },
+      })
+    }
+    const win = window as unknown as { YT?: { Player?: unknown }; onYouTubeIframeAPIReady?: () => void }
+    if (win.YT?.Player) mount()
+    else {
+      const previous = win.onYouTubeIframeAPIReady
+      win.onYouTubeIframeAPIReady = () => { previous?.(); mount() }
+      if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
+        const script = document.createElement('script')
+        script.src = 'https://www.youtube.com/iframe_api'
+        document.body.appendChild(script)
+      }
+    }
+    return () => {
+      dead = true
+      player.current?.destroy?.()
+      player.current = null
+      host.replaceChildren()
+    }
+  }, [videoId])
+  useEffect(() => {
+    if (!play) return
+    let timer = 0
+    const begin = () => {
+      const node = player.current
+      if (!node?.seekTo) {
+        timer = window.setTimeout(begin, 200)
+        return
+      }
+      node.seekTo(play.start, true)
+      node.playVideo()
+      timer = window.setInterval(() => {
+        const now = node.getCurrentTime?.() || 0
+        if (now >= play.end - 0.2) {
+          node.pauseVideo()
+          window.clearInterval(timer)
+        }
+      }, 250)
+    }
+    begin()
+    return () => window.clearInterval(timer)
+  }, [play])
+  return (
+    <div className="source-stage">
+      <div ref={frame} />
+    </div>
+  )
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
@@ -236,6 +326,14 @@ function ReelPlayer({ src, poster = '' }: { src: string; poster?: string }) {
     linger.current = window.setTimeout(() => setHot(false), 2400)
   }
 
+  function seek(value: number) {
+    const node = video.current
+    if (!node || !Number.isFinite(duration) || duration <= 0) return
+    const next = Math.min(duration, Math.max(0, value))
+    node.currentTime = next
+    setTime(next)
+  }
+
   return (
     <div
       className={hot ? 'reel-stage hot' : 'reel-stage'}
@@ -272,6 +370,20 @@ function ReelPlayer({ src, poster = '' }: { src: string; poster?: string }) {
         )}
       </AnimatePresence>
       <div className="reel-bar" onClick={(event) => event.stopPropagation()}>
+        <input
+          className="reel-seek"
+          type="range"
+          min={0}
+          max={duration || 0}
+          step={0.05}
+          value={Math.min(time, duration || 0)}
+          aria-label="Move through the video"
+          aria-valuetext={`${clock(time)} of ${clock(duration)}`}
+          disabled={!duration}
+          style={{ ['--fill' as string]: `${duration ? (time / duration) * 100 : 0}%` }}
+          onInput={(event) => seek(Number(event.currentTarget.value))}
+        />
+        <div className="reel-controls">
         <div className="reel-meta">
           <button type="button" aria-label={playing ? 'Pause' : 'Play'} onClick={toggle}>
             <PlayerIcon name={playing ? 'pause' : 'play'} />
@@ -285,6 +397,7 @@ function ReelPlayer({ src, poster = '' }: { src: string; poster?: string }) {
           <button type="button" aria-label={full ? 'Exit full screen' : 'Full screen'} onClick={toggleFull}>
             <PlayerIcon name={full ? 'exit' : 'full'} />
           </button>
+        </div>
         </div>
       </div>
     </div>
@@ -333,14 +446,6 @@ function Field({ label, children, wide }: { label: string; children: ReactNode; 
       <span className="label">{label}</span>
       {children}
     </motion.div>
-  )
-}
-
-function Check() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M3.2 8.2 6.4 11.3 12.8 4.7" />
-    </svg>
   )
 }
 
@@ -416,71 +521,6 @@ function Menu({ label, value, options, empty, onChange }: { label: string; value
   )
 }
 
-function LiveReel({ clip, image, video, index, bare = false }: { clip: Clip; image: string; video: string; index: number; bare?: boolean }) {
-  const [line, setLine] = useState(-1)
-  useEffect(() => {
-    if (video || clip.lines.length === 0) return
-    const span = Math.max(1, clip.end - clip.start)
-    const started = performance.now()
-    let frame = 0
-    const tick = (now: number) => {
-      const t = ((now - started) / 1000) % span
-      const next = clip.lines.findIndex((item) => t >= item.start && t < item.end + 0.04)
-      setLine((current) => (current === next ? current : next))
-      frame = requestAnimationFrame(tick)
-    }
-    frame = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(frame)
-  }, [clip, video])
-  const caption = line >= 0 && clip.lines[line] ? clip.lines[line].text : ''
-  const phone = <Phone image={image} hook={maskText(clip.hook)} caption={maskText(caption)} video={video} />
-  if (bare) return <div className="moment-reel">{phone}</div>
-  return (
-    <motion.figure
-      className="preview"
-      initial={{ opacity: 0, y: 22, scale: 0.96 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      transition={{ type: 'spring', bounce: 0.22, duration: 0.55, delay: index * 0.08 }}
-    >
-      {phone}
-      <figcaption>{maskText(clip.title)}</figcaption>
-    </motion.figure>
-  )
-}
-
-function Phone({ image, hook, caption, video }: { image: string; hook: string; caption: string; video: string }) {
-  const preview = useRef<HTMLVideoElement>(null)
-  useEffect(() => {
-    preview.current?.pause()
-  }, [video])
-  if (video) {
-    return (
-      <motion.div className="phone" initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ type: 'spring', bounce: 0.18, duration: 0.6 }}>
-        <video ref={preview} className="reel" src={video} controls playsInline preload="none" />
-      </motion.div>
-    )
-  }
-  const safe = image.replace(/"/g, '')
-  return (
-    <motion.div className="phone" initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ type: 'spring', bounce: 0.18, duration: 0.6 }}>
-      <div className="wash" style={safe ? { backgroundImage: `url("${safe}")` } : undefined} />
-      {safe ? <img className="sharp" src={safe} alt="" /> : <div className="sharp blank" />}
-      <AnimatePresence mode="wait">
-        <motion.p key={hook} className="hook" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.25 }}>
-          {hook}
-        </motion.p>
-      </AnimatePresence>
-      <AnimatePresence mode="wait">
-        {caption && (
-          <motion.p key={caption} className="cap" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.18 }}>
-            {caption}
-          </motion.p>
-        )}
-      </AnimatePresence>
-    </motion.div>
-  )
-}
-
 function Work({ job }: { job: Job }) {
   const bad = job.status === 'error'
   const live = job.status === 'running'
@@ -516,7 +556,11 @@ export function App() {
   const [keySaved, setKeySaved] = useState(false)
   const [models, setModels] = useState<Model[]>([])
   const [model, setModel] = useState('')
-  const [count, setCount] = useState(4)
+  const [query, setQuery] = useState('')
+  const [momentFilter, setMomentFilter] = useState<'all' | 'high' | 'kept'>('all')
+  const [momentSort, setMomentSort] = useState<'score' | 'time'>('score')
+  const [playMark, setPlayMark] = useState<PlayMark | null>(null)
+  const [captionOn, setCaptionOn] = useState<Record<string, boolean>>({})
   const [url, setUrl] = useState('')
   const [note, setNote] = useState(NOTES.google)
   const [modelWarn, setModelWarn] = useState(false)
@@ -528,7 +572,6 @@ export function App() {
   const [film, setFilm] = useState('')
   const [source, setSource] = useState<Source>({})
   const [thumb, setThumb] = useState('')
-  const [picked, setPicked] = useState(0)
   const [chosen, setChosen] = useState<number[]>([])
   const [videos, setVideos] = useState<ReelFile[]>([])
   const [folder, setFolder] = useState('')
@@ -555,12 +598,7 @@ export function App() {
         if (data.path) setFolder(data.path)
       }).catch(() => {})
     }
-    try {
-      const savedExports = JSON.parse(sessionStorage.getItem('anuclipz-exported') || '[]')
-      if (Array.isArray(savedExports)) setExported(savedExports)
-    } catch {
-      setExported([])
-    }
+    sessionStorage.removeItem('anuclipz-exported')
     void fetch('/api/spend').then(async (response) => {
       const data = await response.json()
       if (typeof data.usd === 'number') setSpend(data.usd)
@@ -574,20 +612,7 @@ export function App() {
       if (!response.ok || stop) return
       const data = await response.json()
       if (stop) return
-      if (Array.isArray(data.files)) {
-        setExported(data.files)
-        sessionStorage.setItem('anuclipz-exported', JSON.stringify(data.files))
-      }
-      const board = data.board
-      if (board?.clips?.length) {
-        setClips(board.clips)
-        setChosen(board.clips.map((_: Clip, index: number) => index))
-        setFilm(board.title || '')
-        setThumb(board.thumbnail || '')
-        if (board.url) setUrl(board.url)
-        if (board.source) setSource(board.source)
-        setPicked(0)
-      }
+      if (Array.isArray(data.files)) setExported(data.files)
     }).catch(() => {})
     return () => { stop = true }
   }, [folder])
@@ -690,7 +715,8 @@ export function App() {
     })
     try {
       const { id } = await postJson<{ id: string }>('/api/jobs', {
-        kind: 'analyze', url: url.trim(), provider, api_key: apiKey.trim(), model, count,
+        kind: 'analyze', url: url.trim(), provider, api_key: apiKey.trim(), model,
+        query: query.trim(),
         export_dir: folder,
       })
       await watch(id, (next) => {
@@ -701,8 +727,9 @@ export function App() {
           setFilm(next.title || '')
           setThumb(next.thumbnail || '')
           if (next.source) setSource(next.source)
-          setPicked(0)
           setVideos([])
+          setCaptionOn({})
+          setPlayMark(null)
         }
       })
     } catch (err) {
@@ -716,7 +743,6 @@ export function App() {
   }
 
   function toggle(index: number) {
-    setPicked(index)
     setChosen((current) => current.includes(index) ? current.filter((item) => item !== index) : [...current, index].sort((a, b) => a - b))
   }
 
@@ -776,6 +802,7 @@ export function App() {
           lines: clip.lines,
           title: clip.title,
           why: clip.why,
+          captions: captionOn[momentKey(clip)] !== false,
         })),
         film,
         source,
@@ -788,17 +815,11 @@ export function App() {
         const ready = next.files?.length ? next.files : next.file ? [{ file: next.file, title: '', quality: next.quality || '' }] : []
         if (next.status === 'done' && ready.length) {
           setVideos(ready)
-          const saved = ready.filter((item) => item.path).map((item) => ({
-            ...item,
-            thumb: items.find((clip) => clip.start === item.start)?.thumb || '',
-          }))
-          if (saved.length) {
-            setExported((current) => {
-              const merged = [...current, ...saved.filter((item) => !current.some((old) => old.path === item.path))]
-              sessionStorage.setItem('anuclipz-exported', JSON.stringify(merged))
-              return merged
-            })
-          }
+          void fetch('/api/saved?dir=' + encodeURIComponent(folder)).then(async (response) => {
+            if (!response.ok) return
+            const data = await response.json()
+            if (Array.isArray(data.files)) setExported(data.files)
+          }).catch(() => {})
         }
       })
     } catch (err) {
@@ -865,12 +886,8 @@ export function App() {
           />
           <p className={modelWarn ? 'hint warn' : 'hint'}>{modelNote}</p>
         </Field>
-        <Field label="How many">
-          <div className="stepper">
-            <motion.button type="button" whileTap={{ scale: 0.94 }} onClick={() => setCount((value) => Math.max(1, value - 1))} aria-label="Fewer moments">−</motion.button>
-            <span>{count}</span>
-            <motion.button type="button" whileTap={{ scale: 0.94 }} onClick={() => setCount((value) => Math.min(6, value + 1))} aria-label="More moments">+</motion.button>
-          </div>
+        <Field label="Find a specific moment">
+          <input id="query" type="text" value={query} placeholder="The plane on the runway" onChange={(event) => setQuery(event.target.value)} />
         </Field>
         </motion.div>
         <motion.button className="primary" type="submit" disabled={busy} variants={rise} whileHover={busy ? undefined : { y: -1 }} whileTap={{ scale: 0.985 }}>
@@ -895,43 +912,82 @@ export function App() {
             </button>
           )}
         </motion.div>
-        {clips.length === 0 && <motion.p className="empty" variants={rise}>Moments show up here after the model picks them. Each one says what the model found.</motion.p>}
-        {clips.length === 0 && (
-          <div className="preview-row" aria-hidden="true">
-            {Array.from({ length: count }, (_, index) => (
-              <figure className="preview" key={index}>
-                <Phone image="" hook="Title here" caption="Captions..." video="" />
-              </figure>
+        {youtubeId(url) && <SourcePlayer videoId={youtubeId(url)} play={playMark} />}
+        {clips.length > 0 && (
+          <div className="moment-filters" role="toolbar" aria-label="Filter moments">
+            {([['all', 'All'], ['high', 'Score ≥ 80'], ['kept', 'Kept']] as const).map(([id, label]) => (
+              <button key={id} type="button" className={momentFilter === id ? 'on' : ''} aria-pressed={momentFilter === id} onClick={() => setMomentFilter(id)}>
+                {label}
+              </button>
             ))}
+            <button type="button" onClick={() => setMomentSort((value) => value === 'score' ? 'time' : 'score')}>
+              {momentSort === 'score' ? 'By score' : 'By time'}
+            </button>
+          </div>
+        )}
+        {clips.length === 0 && !busy && <motion.p className="empty" variants={rise}>Paste a link and find the moments. They leave when you reload this page.</motion.p>}
+        {clips.length === 0 && busy && (
+          <div className="moment-list" aria-hidden="true">
+            {[0, 1, 2].map((index) => <article className="moment moment-ghost" key={index} />)}
           </div>
         )}
         <motion.div className="moment-list" initial="hidden" animate="show" variants={{ hidden: {}, show: { transition: { staggerChildren: 0.07 } } }}>
           <AnimatePresence>
-            {clips.map((item, index) => {
+            {clips.map((item, index) => ({ item, index }))
+              .filter(({ item, index }) => {
+                if (momentFilter === 'high' && scoreOf(item) < 80) return false
+                if (momentFilter === 'kept' && !chosen.includes(index)) return false
+                return true
+              })
+              .sort((a, b) => momentSort === 'time' ? a.item.start - b.item.start : scoreOf(b.item) - scoreOf(a.item) || a.item.start - b.item.start)
+              .map(({ item, index }) => {
               const on = chosen.includes(index)
-              const video = videos.find((file) => file.start === item.start)?.file || videos.find((file) => file.title === item.title)?.file || ''
+              const key = momentKey(item)
+              const captions = captionOn[key] !== false
+              const quote = item.lines.map((line) => line.text).join(' ').slice(0, 160) || item.why
+              const still = item.thumb || thumb
               return (
                 <motion.article
-                  key={`${item.start}-${item.end}`}
-                  className={on ? (index === picked ? 'moment on focus' : 'moment on') : 'moment'}
+                  key={key}
+                  className={on ? 'moment on' : 'moment'}
                   initial={{ opacity: 0, y: 20, scale: 0.96 }}
                   animate={{ opacity: 1, y: 0, scale: 1 }}
                   exit={{ opacity: 0, y: 10 }}
-                  transition={{ type: 'spring', bounce: 0.28, duration: 0.55, delay: index * 0.07 }}
-                  onClick={(event) => {
-                    if ((event.target as HTMLElement).closest('video, button')) return
-                    toggle(index)
-                  }}
+                  transition={{ type: 'spring', bounce: 0.28, duration: 0.55 }}
                 >
-                  <LiveReel bare clip={item} index={index} image={item.thumb || thumb} video={video} />
-                  <button className="pick" type="button" aria-pressed={on} onClick={() => toggle(index)}>
-                    <motion.span className="tick" aria-hidden="true" animate={{ scale: on ? 1 : 0.92 }} transition={{ type: 'spring', bounce: 0.3, duration: 0.35 }}>{on ? <Check /> : null}</motion.span>
-                    <div>
-                      <div className="title">{maskText(item.title)}</div>
-                      <div className="when">{clock(item.start)} – {clock(item.end)} · {maskText(item.hook)}</div>
-                      <p className="why">{maskText(item.why)}</p>
+                  <div className="moment-still">
+                    {still ? <img src={still} alt="" /> : <div className="sharp blank" />}
+                    <p className="still-hook">{maskText(item.hook)}</p>
+                    {captions && item.lines[0]?.text && <p className="still-cap">{maskText(item.lines[0].text)}</p>}
+                    <button
+                      className="moment-play"
+                      type="button"
+                      aria-label={`Play ${maskText(item.title)} on the source video`}
+                      onClick={() => setPlayMark({ start: item.start, end: item.end, nonce: Date.now() })}
+                    >
+                      <PlayerIcon name="play" />
+                    </button>
+                    <span className="moment-score">{scoreOf(item)}</span>
+                  </div>
+                  <div className="moment-copy">
+                    <h3>{maskText(item.title)}</h3>
+                    <p className="when">{clock(item.start)} → {clock(item.end)} · {Math.round(item.end - item.start)}s</p>
+                    <p className="quote">{maskText(quote)}</p>
+                    <div className="moment-flags">
+                      <label>
+                        <input type="checkbox" checked={on} onChange={() => toggle(index)} />
+                        Keep
+                      </label>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={captions}
+                          onChange={() => setCaptionOn((current) => ({ ...current, [key]: current[key] === false }))}
+                        />
+                        Show captions
+                      </label>
                     </div>
-                  </button>
+                  </div>
                 </motion.article>
               )
             })}
