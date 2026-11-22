@@ -232,6 +232,59 @@ def youtube_url(url: str) -> str:
     return url.split('&')[0]
 
 
+PREVIEW_LOCKS: dict[str, threading.Lock] = {}
+RESOLVE = threading.Lock()
+
+
+def watch_id(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or '').lower()
+    if host.endswith('youtu.be'):
+        return parsed.path.strip('/').split('/')[0]
+    return urllib.parse.parse_qs(parsed.query).get('v', [''])[0]
+
+
+def preview_file(page: str, start: float, end: float) -> Path:
+    vid = watch_id(page)
+    if not re.fullmatch(r'[\w-]{6,}', vid):
+        raise RuntimeError('That link is not a video.')
+    if end <= start or end - start > 200:
+        raise RuntimeError('That part is not one scene.')
+    folder = SCRATCH / 'preview'
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f'{vid}-{int(start * 10)}-{int(end * 10)}.mp4'
+    key = path.name
+    with RESOLVE:
+        lock = PREVIEW_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        if path.is_file() and path.stat().st_size > 1000:
+            return path
+        import yt_dlp
+        from yt_dlp.utils import download_range_func
+        partial = path.with_suffix('.part.mp4')
+        partial.unlink(missing_ok=True)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts(
+                format='bv*[height<=720][ext=mp4]+ba[format_note*=original]/bv*[height<=720]+ba/b',
+                format_sort=['lang', 'res', 'br'],
+                merge_output_format='mp4',
+                outtmpl=str(partial),
+                download_ranges=download_range_func(None, [(max(0.0, start), end + 0.2)]),
+                force_keyframes_at_cuts=True,
+            )) as ydl:
+                ydl.download([page])
+        except Exception:
+            partial.unlink(missing_ok=True)
+            raise
+        if not partial.is_file():
+            matches = sorted(folder.glob(path.stem + '.part.*'))
+            if not matches:
+                raise RuntimeError('That part did not download.')
+            partial = matches[0]
+        partial.replace(path)
+        return path
+
+
 def ydl_opts(**extra):
     opts = {
         'noplaylist': True,
@@ -1733,6 +1786,17 @@ def saved_file(dir: str, name: str, kind: str):
     if not path.is_file() or not path_inside(folder, path):
         fail('Not found.', 404)
     return FileResponse(path, media_type=media)
+
+
+@app.get('/api/preview')
+def preview(url: str, start: float, end: float):
+    page = youtube_url(url)
+    try:
+        path = preview_file(page, start, end)
+    except Exception as exc:
+        message = re.sub(r'https?://\S+', '', clean(str(exc))).strip()[:240]
+        fail(message or 'That part could not be opened.', 502)
+    return FileResponse(path, media_type='video/mp4')
 
 
 @app.get('/api/health')

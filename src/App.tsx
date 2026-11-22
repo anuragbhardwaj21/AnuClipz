@@ -131,75 +131,108 @@ function scoreOf(clip: Clip) {
 }
 
 type PlayMark = { start: number; end: number; nonce: number }
-type YTPlayer = {
-  seekTo: (seconds: number, allowSeekAhead: boolean) => void
-  playVideo: () => void
-  pauseVideo: () => void
-  getCurrentTime: () => number
-  destroy: () => void
-}
 
-function SourcePlayer({ videoId, play }: { videoId: string; play: PlayMark | null }) {
-  const frame = useRef<HTMLDivElement>(null)
-  const player = useRef<YTPlayer | null>(null)
+function SourcePlayer({ pageUrl, play, poster }: { pageUrl: string; play: PlayMark | null; poster: string }) {
+  const node = useRef<HTMLVideoElement>(null)
+  const [note, setNote] = useState('Play a moment to watch that part here.')
+  const src = play ? `/api/preview?url=${encodeURIComponent(pageUrl)}&start=${play.start}&end=${play.end}` : ''
   useEffect(() => {
-    const host = frame.current
-    if (!host) return
-    let dead = false
-    const slot = document.createElement('div')
-    host.replaceChildren(slot)
-    const mount = () => {
-      const YT = (window as unknown as { YT?: { Player: new (el: HTMLElement, opts: object) => YTPlayer } }).YT
-      if (dead || !YT?.Player || player.current) return
-      player.current = new YT.Player(slot, {
-        videoId,
-        playerVars: { rel: 0, modestbranding: 1, playsinline: 1 },
-      })
+    const video = node.current
+    if (!video || !play) {
+      setNote('Play a moment to watch that part here.')
+      return
     }
-    const win = window as unknown as { YT?: { Player?: unknown }; onYouTubeIframeAPIReady?: () => void }
-    if (win.YT?.Player) mount()
-    else {
-      const previous = win.onYouTubeIframeAPIReady
-      win.onYouTubeIframeAPIReady = () => { previous?.(); mount() }
-      if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
-        const script = document.createElement('script')
-        script.src = 'https://www.youtube.com/iframe_api'
-        document.body.appendChild(script)
-      }
+    const span = `${play.start}-${play.end}`
+    if (video.dataset.span === span && video.readyState >= 2) {
+      video.currentTime = 0
+      setNote('')
+      void video.play().catch(() => setNote('Press play on the video.'))
+      return
     }
+    video.dataset.span = span
+    setNote('Opening that part of the video.')
+    const onReady = () => {
+      setNote('')
+      void video.play().catch(() => setNote('Press play on the video.'))
+    }
+    const onError = () => setNote('This part could not be opened.')
+    video.addEventListener('loadeddata', onReady)
+    video.addEventListener('error', onError)
     return () => {
-      dead = true
-      player.current?.destroy?.()
-      player.current = null
-      host.replaceChildren()
+      video.removeEventListener('loadeddata', onReady)
+      video.removeEventListener('error', onError)
     }
-  }, [videoId])
-  useEffect(() => {
-    if (!play) return
-    let timer = 0
-    const begin = () => {
-      const node = player.current
-      if (!node?.seekTo) {
-        timer = window.setTimeout(begin, 200)
-        return
-      }
-      node.seekTo(play.start, true)
-      node.playVideo()
-      timer = window.setInterval(() => {
-        const now = node.getCurrentTime?.() || 0
-        if (now >= play.end - 0.2) {
-          node.pauseVideo()
-          window.clearInterval(timer)
-        }
-      }, 250)
-    }
-    begin()
-    return () => window.clearInterval(timer)
   }, [play])
   return (
     <div className="source-stage">
-      <div ref={frame} />
+      {src ? (
+        <video key={src} ref={node} src={src} poster={poster || undefined} controls playsInline preload="auto" />
+      ) : poster ? (
+        <img className="source-poster" src={poster} alt="" />
+      ) : null}
+      {note && <p className="source-note">{note}</p>}
     </div>
+  )
+}
+
+function MomentCard({
+  item, image, on, captions, onToggle, onCaptions, onPlay,
+}: {
+  item: Clip
+  image: string
+  on: boolean
+  captions: boolean
+  onToggle: () => void
+  onCaptions: () => void
+  onPlay: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const quote = maskText(item.lines.map((line) => line.text).join(' ') || item.why)
+  const long = quote.length > 120
+  const safe = image.replace(/"/g, '')
+  return (
+    <motion.article
+      className={on ? 'moment on' : 'moment'}
+      initial={{ opacity: 0, y: 16 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 8 }}
+      transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
+    >
+      <div className="moment-reel">
+        <div className="phone">
+          <div className="wash" style={safe ? { backgroundImage: `url("${safe}")` } : undefined} />
+          {safe ? <img className="sharp" src={safe} alt="" /> : <div className="sharp blank" />}
+          <p className="hook">{maskText(item.hook)}</p>
+          {captions && item.lines[0]?.text && <p className="cap">{maskText(item.lines[0].text)}</p>}
+          <button className="moment-play" type="button" aria-label={`Play ${maskText(item.title)}`} onClick={onPlay}>
+            <PlayerIcon name="play" />
+          </button>
+        </div>
+      </div>
+      <div className="moment-copy">
+        <div className="moment-title">
+          <h3>{maskText(item.title)}</h3>
+          <span className="moment-score">{scoreOf(item)}</span>
+        </div>
+        <p className="when">{clock(item.start)} → {clock(item.end)} · {Math.round(item.end - item.start)}s</p>
+        <p className={open || !long ? 'quote' : 'quote clamp'}>{quote}</p>
+        {long && (
+          <button type="button" className="quote-more" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+            {open ? 'Less' : 'More'}
+          </button>
+        )}
+        <div className="moment-flags">
+          <label>
+            <input type="checkbox" checked={on} onChange={onToggle} />
+            Keep
+          </label>
+          <label>
+            <input type="checkbox" checked={captions} onChange={onCaptions} />
+            Show captions
+          </label>
+        </div>
+      </div>
+    </motion.article>
   )
 }
 
@@ -912,7 +945,7 @@ export function App() {
             </button>
           )}
         </motion.div>
-        {youtubeId(url) && <SourcePlayer videoId={youtubeId(url)} play={playMark} />}
+        {youtubeId(url) && <SourcePlayer pageUrl={url.trim()} play={playMark} poster={thumb} />}
         {clips.length > 0 && (
           <div className="moment-filters" role="toolbar" aria-label="Filter moments">
             {([['all', 'All'], ['high', 'Score ≥ 80'], ['kept', 'Kept']] as const).map(([id, label]) => (
@@ -941,54 +974,22 @@ export function App() {
               })
               .sort((a, b) => momentSort === 'time' ? a.item.start - b.item.start : scoreOf(b.item) - scoreOf(a.item) || a.item.start - b.item.start)
               .map(({ item, index }) => {
-              const on = chosen.includes(index)
               const key = momentKey(item)
-              const captions = captionOn[key] !== false
-              const quote = item.lines.map((line) => line.text).join(' ').slice(0, 160) || item.why
-              const still = item.thumb || thumb
               return (
-                <motion.article
+                <MomentCard
                   key={key}
-                  className={on ? 'moment on' : 'moment'}
-                  initial={{ opacity: 0, y: 20, scale: 0.96 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: 10 }}
-                  transition={{ type: 'spring', bounce: 0.28, duration: 0.55 }}
-                >
-                  <div className="moment-still">
-                    {still ? <img src={still} alt="" /> : <div className="sharp blank" />}
-                    <p className="still-hook">{maskText(item.hook)}</p>
-                    {captions && item.lines[0]?.text && <p className="still-cap">{maskText(item.lines[0].text)}</p>}
-                    <button
-                      className="moment-play"
-                      type="button"
-                      aria-label={`Play ${maskText(item.title)} on the source video`}
-                      onClick={() => setPlayMark({ start: item.start, end: item.end, nonce: Date.now() })}
-                    >
-                      <PlayerIcon name="play" />
-                    </button>
-                    <span className="moment-score">{scoreOf(item)}</span>
-                  </div>
-                  <div className="moment-copy">
-                    <h3>{maskText(item.title)}</h3>
-                    <p className="when">{clock(item.start)} → {clock(item.end)} · {Math.round(item.end - item.start)}s</p>
-                    <p className="quote">{maskText(quote)}</p>
-                    <div className="moment-flags">
-                      <label>
-                        <input type="checkbox" checked={on} onChange={() => toggle(index)} />
-                        Keep
-                      </label>
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={captions}
-                          onChange={() => setCaptionOn((current) => ({ ...current, [key]: current[key] === false }))}
-                        />
-                        Show captions
-                      </label>
-                    </div>
-                  </div>
-                </motion.article>
+                  item={item}
+                  image={item.thumb || thumb}
+                  on={chosen.includes(index)}
+                  captions={captionOn[key] !== false}
+                  onToggle={() => toggle(index)}
+                  onCaptions={() => setCaptionOn((current) => ({ ...current, [key]: current[key] === false }))}
+                  onPlay={() => {
+                    setPlayMark({ start: item.start, end: item.end, nonce: Date.now() })
+                    const motion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+                    document.querySelector('.source-stage')?.scrollIntoView({ behavior: motion ? 'auto' : 'smooth', block: 'nearest' })
+                  }}
+                />
               )
             })}
           </AnimatePresence>
